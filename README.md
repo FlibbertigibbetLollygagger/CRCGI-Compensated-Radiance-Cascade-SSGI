@@ -9,7 +9,7 @@ The shader works on its own like any other ReShade effect. The add-on is optiona
 
 ## Requirements
 
-- ReShade with add-on support (the add-on build, 6.x) for the exe you're playing. The add-on is built against one pinned ReShade revision (it's written in the add-on's Options tab under Build, and in `.github/workflows/build.yml`), so use a ReShade 6.x add-on build that's close to it if something doesn't load.
+- ReShade with add-on support (the add-on build, 6.x) for the exe you're playing. The add-on is built against one pinned ReShade revision (it's written in the add-on's Options tab under Build, and in `.github/workflows/build.yml` in my private repo), so use a ReShade 6.x add-on build that's close to it if something doesn't load.
 - Direct3D 10, 11 or 12, Vulkan, or OpenGL. DirectX 9 games work through DXVK (ReShade sees that as Vulkan), native DirectX 9 isn't supported because CRCGI needs Direct3D 10 or newer.
 - A 64-bit game uses `crcgi_injector.addon64`, a 32-bit game uses `crcgi_injector.addon32`.
 
