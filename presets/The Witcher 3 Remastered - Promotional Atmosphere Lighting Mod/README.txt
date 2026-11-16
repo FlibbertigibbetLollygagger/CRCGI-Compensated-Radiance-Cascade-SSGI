@@ -1,3 +1,6 @@
+Update 1.1: The shaders temporal stability is improved by a noticable amount but it still isn't as coherent as I would like. The extra stability however, allowed me to increase relit bias and multibounce reflectance a bit to improve the overall image and reduce reliance on the game's own lighting. Temporal accumulation values are also retuned to be more aggressive a bit to reduce ghosting. History should now have a tendency to not drop as much as it did on v1, but it still has a long way to go.
+
+
 This preset is probably not going to look as good as possible in some niche cases, but at the very least it is a good starting point.
 Color bleeding, brightness control and overall color control is done in a way the is not intrusive.
 Remember, Diffuse GI is inherently very subtle, most ray tracing approaches are a bit overdone.
