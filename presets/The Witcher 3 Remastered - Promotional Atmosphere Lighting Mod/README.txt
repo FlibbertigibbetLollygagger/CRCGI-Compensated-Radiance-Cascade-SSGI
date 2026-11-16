@@ -1,3 +1,6 @@
+Quick Performance note: Enable Reshade's Performance Mode after tuning is done. It helps a lot, especially with these complicated shaders.
+
+
 Update 1.1: The shaders temporal stability is improved by a noticable amount but it still isn't as coherent as I would like. The extra stability however, allowed me to increase relit bias and multibounce reflectance a bit to improve the overall image and reduce reliance on the game's own lighting. Temporal accumulation values are also retuned to be more aggressive a bit to reduce ghosting. History should now have a tendency to not drop as much as it did on v1, but it still has a long way to go.
 
 
