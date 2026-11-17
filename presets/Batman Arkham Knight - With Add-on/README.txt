@@ -1,3 +1,4 @@
+I do not know if the preset is playable, it is calibrated over an afternoon as an experiment.
 Download v1 zip for the add-on, use shaders v1.1 zip for the shader
 Turn on performance mode
 
