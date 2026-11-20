@@ -1,3 +1,5 @@
+Update v1.2: A CRCGI v1.2 copy of this preset is included (same values, only the section and technique names point at CRCGI_v1.2.fx, made with tools/retarget_preset.py). Settings keep their names between versions, so any older CRCGI preset can be retargeted the same way. Also, the injector file is obsolete but you can use it. It still loses albedo and other injection layers tho
+
 I do not know if the preset is playable, it is calibrated over an afternoon as an experiment.
 Download v1 zip for the add-on, use shaders v1.1 zip for the shader
 Turn on performance mode

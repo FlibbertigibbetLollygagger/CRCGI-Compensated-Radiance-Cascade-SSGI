@@ -1,21 +1,23 @@
 // ============================================================================
 // CRCGI Injector - ReShade add-on
 //
-// Runs the CRCGI effect INSIDE the game's frame instead of on the finished image, and hands it what the game knows:
+// Hands the CRCGI effect what the game knows, and lets it ignore what is drawn after the 3D scene is finished.
 //   Level A  nothing: the effect runs at the end of the frame like any ReShade effect.
-//   Level B  the effect is rendered right before a chosen layer (behind fog, UI, ...), with the depth buffer in use at that
-//            point and the camera's field of view read from the game. The shader's tonemapper conversion is never changed.
-//   Level C  level B plus the G-buffer feeds taken from the game's own render targets: normals, albedo, motion vectors, HDR scene light.
+//   Level B  A plus the camera's field of view read from the game (and, with "Force render" on, the effect rendered inside the frame).
+//   Level C  B plus feeds taken from the game's own render targets: normals, albedo, motion vectors, HDR scene light, and the finished
+//            frame (a copy of the image where the game's 3D rendering is done: the effect works on it and leaves UI, fog and
+//            everything drawn after it untouched).
 //
-// A "layer" is one render-target binding interval of the frame, listed in the order seen. Pick the layer to render at, and
-// (level C) say which layers hold normals, albedo and motion vectors. Everything is saved per game next to the executable.
-// In-frame injection: Direct3D 10 / 11, and Direct3D 12 with the add-on's own state tracker (experimental). The G-buffer feeds (level C) and the
-// profiler: D3D10 / 11 / 12, Vulkan and OpenGL (Vulkan / OpenGL render at the end of the frame).
+// A "layer" is one render-target binding interval of the frame, listed in the order seen (only layers drawn every frame by default).
+// A feed is taken from a layer or from a texture picked in the profiler. Everything is saved per game next to the executable, and the
+// target listing can be exported and shared (Options).
+// Feeds and the profiler: Direct3D 10 / 11 / 12, Vulkan and OpenGL. Forced in-frame rendering (advanced): Direct3D 10 / 11 and
+// Direct3D 12 with the add-on's own state tracker (experimental).
 // ============================================================================
 #include "ui.hpp"
 
 extern "C" __declspec(dllexport) const char *NAME = "CRCGI Injector";
-extern "C" __declspec(dllexport) const char *DESCRIPTION = "Radiance cascade injection: renders CRCGI inside the game's frame with the game's depth, camera, normals, albedo and motion vectors.";
+extern "C" __declspec(dllexport) const char *DESCRIPTION = "Gives CRCGI what the game knows (camera, normals, albedo, motion vectors, HDR light) and lets it ignore the UI and fog drawn after the 3D scene.";
 
 static bool s_registered = false;
 
@@ -31,6 +33,9 @@ static void unregister_all()
     reshade::unregister_event<addon_event::unmap_buffer_region>(on_unmap_buffer_region);
     reshade::unregister_event<addon_event::map_buffer_region>(on_map_buffer_region);
     reshade::unregister_event<addon_event::update_buffer_region>(on_update_buffer_region);
+    reshade::unregister_event<addon_event::clear_render_target_view>(on_clear_render_target_view);
+    reshade::unregister_event<addon_event::dispatch>(on_dispatch);
+    reshade::unregister_event<addon_event::draw_or_dispatch_indirect>(on_draw_or_dispatch_indirect);
     reshade::unregister_event<addon_event::draw_indexed>(on_draw_indexed);
     reshade::unregister_event<addon_event::draw>(on_draw);
     reshade::unregister_event<addon_event::bind_render_targets_and_depth_stencil>(on_bind_render_targets);
@@ -93,6 +98,9 @@ extern "C" __declspec(dllexport) bool AddonInit(HMODULE addon_module, HMODULE re
     reshade::register_event<addon_event::bind_scissor_rects>(on_bind_scissor_rects);
     reshade::register_event<addon_event::draw>(on_draw);
     reshade::register_event<addon_event::draw_indexed>(on_draw_indexed);
+    reshade::register_event<addon_event::draw_or_dispatch_indirect>(on_draw_or_dispatch_indirect);
+    reshade::register_event<addon_event::dispatch>(on_dispatch);
+    reshade::register_event<addon_event::clear_render_target_view>(on_clear_render_target_view);
     reshade::register_event<addon_event::update_buffer_region>(on_update_buffer_region);
     reshade::register_event<addon_event::map_buffer_region>(on_map_buffer_region);
     reshade::register_event<addon_event::unmap_buffer_region>(on_unmap_buffer_region);

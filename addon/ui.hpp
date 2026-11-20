@@ -1,8 +1,11 @@
 // CRCGI Injector - overlay. Status on top, then tabs: Setup (quick start + checklist), G-Buffer (the game's feeds), Layers
 // (the recorded layer list), Profiler (game textures with thumbnails and content analysis), Keys (remappable), Debug, Options.
+// Laid out vertically: every list is a stack of cards and every widget scales with the window, so the overlay stays usable at about a
+// third of a 1440p screen's width.
 // The overlay edits copies of the settings and commits them under the lock, so it never races the render thread.
 #pragma once
 #include "events.hpp"
+#include <cstdarg>
 
 static const ImVec4 COL_OK(0.45f, 0.85f, 0.45f, 1.0f);
 static const ImVec4 COL_WARN(1.0f, 0.65f, 0.3f, 1.0f);
@@ -114,12 +117,32 @@ static std::string bound_key(int action)
 
 static float s_thumb = 200.0f;   // thumbnail width (G-Buffer, Profiler), adjustable
 
+// Width of a widget: `chars` font heights, but never more than 62% of the space the window has left (labels sit to the right).
+static float fit(float chars)
+{
+    const float fs = ImGui::GetFontSize();
+    return std::min(fs * chars, std::max(ImGui::GetContentRegionAvail().x * 0.62f, fs * 8.0f));
+}
+
+// A line of text that wraps at the window's edge, in the dim colour.
+static void dim_wrapped(const char *fmt, ...)
+{
+    char buf[1024];
+    va_list ap;
+    va_start(ap, fmt);
+    std::vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    ImGui::PushStyleColor(ImGuiCol_Text, COL_DIM);
+    ImGui::TextWrapped("%s", buf);
+    ImGui::PopStyleColor();
+}
+
 // ---------------------------------------------------------------------------------------------------------------------
 // Status
 // ---------------------------------------------------------------------------------------------------------------------
 static void draw_status(effect_runtime *)
 {
-    bool master, injected_recent, has_inject, fallback;
+    bool master, injected_recent, has_inject, force, scene_set;
     int level;
     device_api api;
     std::string status, settings_error;
@@ -131,9 +154,10 @@ static void draw_status(effect_runtime *)
         level = g.level;
         injected_recent = g.injected_frame != ~0ull && g.injected_frame + 1 >= g.frame;
         has_inject = g.role_ref[ROLE_INJECT].valid();
+        force = g.force_inject;
+        scene_set = g.feed[FEED_SCENE].enabled && g.feed[FEED_SCENE].assigned();
         status = g.status;
         settings_error = g.settings_error;
-        fallback = g.fallback_end;
         api = g.api;
     }
 
@@ -142,50 +166,57 @@ static void draw_status(effect_runtime *)
     edit_setting(g.master, [&](bool &v) { return ImGui::Checkbox(lbl, &v); });
     tip("Off: the add-on does nothing and ReShade runs the effect at the end of the frame as usual.");
     ImGui::SameLine();
-    ImGui::TextColored(COL_DIM, "   %s, %s", api_name(api), sizeof(void *) == 8 ? "64-bit" : "32-bit");
-    ImGui::SetNextItemWidth(ImGui::GetFontSize() * 28.0f);
+    ImGui::TextColored(COL_DIM, "%s, %s", api_name(api), sizeof(void *) == 8 ? "64-bit" : "32-bit");
+    ImGui::SetNextItemWidth(fit(28.0f));
     std::snprintf(lbl, sizeof(lbl), "Level  (%s / %s)", bound_key(KA_LEVEL_DOWN).c_str(), bound_key(KA_LEVEL_UP).c_str());
     edit_setting(g.level, [&](int &v) {
-        return ImGui::Combo(lbl, &v, "A  End of frame, nothing touched\0B  Inside the frame (+ depth, camera)\0C  Full: B + the game's G-buffer\0");
+        return ImGui::Combo(lbl, &v, "A  End of frame, nothing touched\0B  A + the game's camera (FOV)\0C  B + the game's G-buffer and finished frame\0");
     });
-    tip("A: plain ReShade.\nB: the effect is rendered at a layer you choose (behind the UI), with the depth buffer in use there and the game's FOV.\n"
-        "C: B plus the game's normals, albedo, motion vectors and HDR scene light (G-Buffer tab). Works at the end of the frame "
-        "too, where in-frame injection is not available (Vulkan / DXVK, OpenGL, D3D12 with injection off).");
+    tip("A: plain ReShade, the effect runs at the end of the frame.\n"
+        "B: the camera's field of view is read from the game and written to the shader (and, with Force render on in Options, the effect "
+        "is rendered inside the frame at a layer you choose).\n"
+        "C: B plus the feeds: the game's normals, albedo, motion vectors, HDR scene light and the finished frame (G-Buffer tab). The "
+        "effect still runs at the end of the frame; the feeds are copies taken while the game draws.");
 
     if (!settings_error.empty())
         ImGui::TextColored(COL_WARN, "%s", settings_error.c_str());
     if (!g_conflict.empty())
-        ImGui::TextWrapped("\"%s\" is loaded. It also moves effects into the frame, so in-frame injection stands down. Feeds at the end of "
+        ImGui::TextWrapped("\"%s\" is loaded. It also moves effects into the frame, so forced in-frame rendering stands down. Feeds at the end of "
                            "the frame and the profiler still work.", g_conflict.c_str());
     if (!master)
-        ImGui::TextColored(COL_DIM, "Off: ReShade runs the effect at the end of the frame as usual.");
+        dim_wrapped("Off: ReShade runs the effect at the end of the frame as usual.");
     else if (level == LEVEL_A)
-        ImGui::TextColored(COL_DIM, "Level A: the effect runs at the end of the frame, nothing is changed.");
-    else if (!api_supports_injection(api) || !g_conflict.empty())
-    {
-        if (g_conflict.empty())
-        {
-            ImGui::PushStyleColor(ImGuiCol_Text, COL_DIM);
-            ImGui::TextWrapped("%s: %s", api_name(api), injection_unsupported_reason(api));
-            ImGui::PopStyleColor();
-        }
-        if (level >= LEVEL_C)
-            ImGui::TextColored(COL_OK, "Level C at the end of the frame: the game's G-buffer is captured inside the frame and handed to the shader.");
-    }
-    else if (!has_inject)
-        ImGui::TextColored(COL_WARN, "No injection layer yet: press Auto-setup (Setup tab, %s) or pick one in Layers. Until then: end of frame.",
-                           bound_key(KA_AUTO_SETUP).c_str());
-    else if (!status.empty())
-    {
-        ImGui::PushStyleColor(ImGuiCol_Text, COL_WARN);
-        ImGui::TextWrapped("%s", status.c_str());
-        ImGui::PopStyleColor();
-    }
-    else if (injected_recent)
-        ImGui::TextColored(COL_OK, "Rendering inside the frame at %s", layer_text(inject_ref).c_str());
+        dim_wrapped("Level A: the effect runs at the end of the frame, nothing is changed.");
     else
-        ImGui::TextColored(COL_WARN, "The injection layer was not drawn in the last frame (menu / loading screen?).%s",
-                           fallback ? " Rendering at the end of the frame instead." : " Not rendered (fallback is off).");
+    {
+        if (level >= LEVEL_C)
+        {
+            if (!scene_set)
+                dim_wrapped("No finished frame chosen: the effect works on the final image, UI included. Give the last layer before the UI the "
+                            "role \"Finished frame\" in the Layers tab to leave UI and fog alone.");
+            else if (feed_ready(FEED_SCENE))
+                ImGui::TextColored(COL_OK, "Finished frame delivered: UI and fog drawn after it are left untouched.");
+            else
+                ImGui::TextColored(COL_WARN, "The finished frame was not captured in this frame (menu / loading screen?): the effect uses the final image.");
+        }
+        if (force)
+        {
+            if (!api_supports_injection(api) || !g_conflict.empty())
+                dim_wrapped("Force render: %s", injection_unsupported_reason(api));
+            else if (!has_inject)
+                ImGui::TextColored(COL_WARN, "Force render is on, but no layer has the role \"Force render here\". The effect runs at the end of the frame.");
+            else if (!status.empty())
+            {
+                ImGui::PushStyleColor(ImGuiCol_Text, COL_WARN);
+                ImGui::TextWrapped("%s", status.c_str());
+                ImGui::PopStyleColor();
+            }
+            else if (injected_recent)
+                ImGui::TextColored(COL_OK, "Force render: rendering inside the frame at %s", layer_text(inject_ref).c_str());
+            else
+                ImGui::TextColored(COL_WARN, "Force render: the layer was not drawn in the last frame, the effect runs at the end of the frame.");
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -248,7 +279,7 @@ static void draw_techniques(effect_runtime *rt)
         techs = g.techs;
         managed = g.techniques;
     }
-    ImGui::TextColored(COL_DIM, "Ticked techniques are rendered at the injection layer, if they are also enabled in ReShade.");
+    dim_wrapped("Ticked techniques are rendered at the forced layer, if they are also enabled in ReShade.");
     for (const TechInfo &t : techs)
     {
         bool on = contains(managed, t.key);
@@ -277,40 +308,25 @@ static void check_line(bool ok, bool warn, const char *what, const std::string &
 {
     ImGui::TextColored(ok ? COL_OK : (warn ? COL_WARN : COL_DIM), ok ? "[ok]" : (warn ? "[!!]" : "[--]"));
     ImGui::SameLine();
-    ImGui::Text("%s:", what);
-    ImGui::SameLine();
-    ImGui::PushStyleColor(ImGuiCol_Text, COL_DIM);
-    ImGui::TextWrapped("%s", detail.c_str());
-    ImGui::PopStyleColor();
+    ImGui::Text("%s", what);
+    ImGui::Indent(ImGui::GetFontSize() * 1.2f);
+    dim_wrapped("%s", detail.c_str());
+    ImGui::Unindent(ImGui::GetFontSize() * 1.2f);
 }
 
 static void draw_setup(effect_runtime *rt)
 {
     section("Quick start");
-    ImGui::TextWrapped("1. Enable CRCGI v1 in ReShade.   2. Play until the scene is on screen, then press Auto-setup.   3. Check the result "
-                       "below and in the shader's Debug: G-Buffer & Canvas views. Everything is saved per game.");
-    char lbl[96];
-    std::snprintf(lbl, sizeof(lbl), "Auto-setup: injection layer + all feeds  (%s)", bound_key(KA_AUTO_SETUP).c_str());
-    if (ImGui::Button(lbl, ImVec2(ImGui::GetFontSize() * 24.0f, 0.0f)))
-        auto_suggest();
-    tip("Picks the injection layer by the rule below, then takes a snapshot of the game's render targets, analyses their contents and "
-        "assigns normals, albedo, motion vectors and the HDR scene light, REPLACING earlier choices. Repeat it after a loading screen "
-        "if something looks wrong.");
+    ImGui::TextWrapped("1. Enable CRCGI in ReShade. It runs at the end of the frame, like any effect.");
+    ImGui::TextWrapped("2. Optional (level C): let it use what the game knows. Profiler: Take snapshot, read the suggestions, press Use as. "
+                       "Layers: give the last layer before the UI the role Finished frame.");
+    ImGui::TextWrapped("3. Check the result in the shader's Debug views. Everything is saved per game and can be shared (Options).");
 
-    ImGui::SetNextItemWidth(ImGui::GetFontSize() * 26.0f);
-    edit_setting(g.inject_policy, [](int &v) { return ImGui::Combo("Render CRCGI", &v, INJECT_POLICY_ITEMS); });
-    help("Where Auto-setup puts the effect. Layers are classified by how they are drawn (Layers tab, Kind column):\n"
-         "Before the UI: after all post-processing, below the HUD (safest).\n"
-         "Before post-processing: the first full-screen pass after the scene that draws into a screen-format target (before film grain, "
-         "sharpening, colour grading done after tonemapping).\n"
-         "Before transparent effects: GI goes under fog, particles and glass.\n"
-         "The effect can only be rendered into a target of the back buffer's size and format: HDR float targets before tonemapping are "
-         "not possible, the next suitable layer is used.");
-    ImGui::SetNextItemWidth(ImGui::GetFontSize() * 26.0f);
-    edit_setting(g.upscale_mode, [](int &v) { return ImGui::Combo("Upscaler (DLSS / FSR / XeSS)", &v, UPSCALE_ITEMS); });
-    help("Upscalers render the 3D scene below the output resolution, e.g. 1707 x 960 for 1440p in Quality mode, so the G-buffer is smaller "
-         "than the screen. With this on, textures at the render resolution count as screen-sized in the layer list, the profiler and the "
-         "auto-detection, and can be used as feeds (the shader samples them across the whole screen).\n"
+    ImGui::SetNextItemWidth(fit(26.0f));
+    edit_setting(g.upscale_mode, [](int &v) { return ImGui::Combo("Upscaler", &v, UPSCALE_ITEMS); });
+    help("DLSS / FSR / XeSS render the 3D scene below the output resolution, e.g. 1707 x 960 for 1440p in Quality mode, so the G-buffer is "
+         "smaller than the screen. With this on, textures at the render resolution count as screen-sized in the layer list and the "
+         "profiler, and can be used as feeds (the shader samples them across the whole screen).\n"
          "Auto-detect: the most-drawn size below the screen's, of the screen's aspect, drawn with depth.");
     int up;
     uint32_t rw, rh, bw, bh;
@@ -324,7 +340,7 @@ static void draw_setup(effect_runtime *rt)
     }
     if (up == UP_CUSTOM)
     {
-        ImGui::SetNextItemWidth(ImGui::GetFontSize() * 12.0f);
+        ImGui::SetNextItemWidth(fit(12.0f));
         edit_setting(g.upscale_pct, [](float &v) { return ImGui::SliderFloat("Render scale (%)", &v, 20.0f, 100.0f, "%.1f"); });
     }
     if (up != UP_OFF)
@@ -335,30 +351,10 @@ static void draw_setup(effect_runtime *rt)
             ImGui::TextColored(COL_DIM, "Render resolution: native (no smaller scene targets found)");
     }
 
-    std::string rep, feeds_rep;
-    {
-        std::lock_guard<std::mutex> lock(g.mtx);
-        rep = g.auto_report;
-    }
-    {
-        std::lock_guard<std::mutex> lock(prof.m);
-        feeds_rep = prof.auto_assign_pending ? "analysing..." : prof.last_auto;
-    }
-    if (!rep.empty() || !feeds_rep.empty())
-    {
-        ImGui::PushStyleColor(ImGuiCol_Text, COL_DIM);
-        if (!rep.empty())
-            ImGui::TextWrapped("Last auto-setup: %s", rep.substr(0, rep.find("  Feeds:")).c_str());
-        if (!feeds_rep.empty())
-            ImGui::TextWrapped("Feeds: %s", feeds_rep.c_str());
-        ImGui::PopStyleColor();
-    }
-
     // Checklist
     section("Checklist");
     bool tech_on = false;
     std::vector<effect_technique> techs;
-    LayerRef inj;
     int level;
     bool master, cam_valid;
     CamCandidate cam;
@@ -367,7 +363,6 @@ static void draw_setup(effect_runtime *rt)
     {
         std::lock_guard<std::mutex> lock(g.mtx);
         techs = resolve_techniques_locked();
-        inj = g.role_ref[ROLE_INJECT];
         level = g.level;
         master = g.master;
         cam_valid = g.cam_valid;
@@ -378,14 +373,12 @@ static void draw_setup(effect_runtime *rt)
     }
     for (effect_technique t : techs)
         tech_on |= rt->get_technique_state(t) || [&] { std::lock_guard<std::mutex> l(g.mtx); return contains(g.suppressed, t); }();
-    check_line(tech_on, true, "CRCGI technique", tech_on ? "enabled in ReShade" : "not enabled in ReShade (or not ticked under Techniques)");
-    const bool inj_api = api_supports_injection(g.api) && g_conflict.empty();
-    check_line(inj.valid() && inj_api, inj_api, "Injection layer",
-               !inj_api ? "end of the frame on this API" : (inj.valid() ? layer_text(inj) : std::string("none: end of the frame")));
-    check_line(depth_status.empty(), !depth_status.empty(), "Depth", depth_status.empty() ? "ReShade's depth, or the depth in use at the layer" : depth_status);
+    check_line(tech_on, true, "CRCGI technique", tech_on ? "enabled in ReShade" : "not enabled in ReShade (or not ticked under Options > Force render)");
     char cb[96];
     std::snprintf(cb, sizeof(cb), "vertical FOV %.1f", cam.fov);
     check_line(cam_valid, false, "Camera", cam_valid ? cb : "not detected: the shader's own Field of View is used");
+    if (!depth_status.empty())
+        check_line(false, true, "Depth", depth_status);
     for (int i = 0; i < FEED_COUNT; i++)
     {
         if (!UI_MATERIAL && i == FEED_MATERIAL)
@@ -411,16 +404,14 @@ static void draw_setup(effect_runtime *rt)
         check_line(ok, warn, FEED_LABEL[i], d);
     }
 
-    if (ImGui::CollapsingHeader("Techniques to render"))
-        draw_techniques(rt);
     if (ImGui::CollapsingHeader("Camera"))
         draw_camera();
     if (ImGui::CollapsingHeader("Shader link"))
     {
         static const char *const NAMES[] = { "FieldOfView", "UseNormalTexture", "Integration_NormalSpace", "Integration_GeometrySource", "Integration_Albedo",
-                                             "Integration_Motion", "Integration_HDRScene",
+                                             "Integration_Motion", "Integration_HDRScene", "Integration_Scene",
                                              "Integration_NormalMode", "Integration_MotionUnits", "GBufferDebugView" };
-        ImGui::TextColored(COL_DIM, "Shader controls the add-on can write (missing = the shader is not loaded or is a different one). Convert Tonemapper is never written.");
+        dim_wrapped("Shader controls the add-on can write (missing = the shader is not loaded or is a different one). Convert Tonemapper is never written.");
         for (const char *n : NAMES)
         {
             bool found = uniform_found(n);
@@ -441,7 +432,10 @@ static const char *const FEED_HELP[FEED_COUNT] = {
     "accumulation, the canvas and multibounce.",
     "The G-buffer target that holds metalness / specular / roughness (not offered in this release).",
     "The game's lighting buffer before tonemapping, bloom, fog and UI (usually RGBA16F / R11G11B10F). Rays pick up light from it: "
-    "cleaner and with the real brightness range. The exposure is matched to the image automatically." };
+    "cleaner and with the real brightness range. The exposure is matched to the image automatically.",
+    "A copy of the image at the point where the game's 3D rendering is finished: the layer right before the UI, before fog or before "
+    "whatever should not be touched. The effect works on this copy and adds its light to the final image, so everything drawn after the "
+    "copy is left alone (the shader's Use Game Finished Frame If Provided)." };
 
 static void draw_feeds(effect_runtime *rt)
 {
@@ -456,36 +450,9 @@ static void draw_feeds(effect_runtime *rt)
         for (int i = 0; i < FEED_COUNT; i++)
             fc[i] = g.feed[i];
     }
-    char lbl[96];
-    std::snprintf(lbl, sizeof(lbl), "Auto-detect and assign  (%s)", bound_key(KA_AUTO_FEEDS).c_str());
-    if (ImGui::Button(lbl))
-    {
-        pool_request_snapshot(true, true);
-        std::lock_guard<std::mutex> lock(g.mtx);
-        if (g.level < LEVEL_C) g.level = LEVEL_C;
-        g.dirty = true;
-    }
-    tip("One snapshot of the game's render targets, a content analysis, and the best match per feed is assigned (replacing earlier "
-        "choices).");
-    ImGui::SameLine();
-    edit_setting(g.auto_redetect, [](bool &v) { return ImGui::Checkbox("Re-detect after loading screens", &v); });
-    help("When an assigned texture is destroyed (games recreate their G-buffer on loads and resolution changes) and no new texture of the "
-         "same kind takes its place within half a second, or it is not drawn for 3 seconds, the detection runs again and replaces it. At "
-         "most once every 10 seconds.");
-    ImGui::SameLine();
-    ImGui::SetNextItemWidth(ImGui::GetFontSize() * 8.0f);
+    ImGui::SetNextItemWidth(fit(8.0f));
     ImGui::SliderFloat("thumbnails", &s_thumb, 96.0f, 320.0f, "%.0f px");
-    {
-        std::lock_guard<std::mutex> lock(prof.m);
-        if (prof.auto_assign_pending)
-            ImGui::TextColored(COL_WARN, "Analysing...");
-        else if (!prof.last_auto.empty())
-        {
-            ImGui::PushStyleColor(ImGuiCol_Text, COL_DIM);
-            ImGui::TextWrapped("Last detection: %s", prof.last_auto.c_str());
-            ImGui::PopStyleColor();
-        }
-    }
+    dim_wrapped("Feeds are assigned by you: from a texture in the Profiler (Use as) or from a layer (its Role in the Layers tab).");
     if (!master || level < LEVEL_C)
         ImGui::TextColored(COL_WARN, "Feeds are handed to the shader at level C (%s).", bound_key(KA_LEVEL_UP).c_str());
 
@@ -505,7 +472,8 @@ static void draw_feeds(effect_runtime *rt)
                        rd[FEED_ALBEDO] ? "[skipped]" : "[runs]   ");
     ImGui::TextColored(rd[FEED_MOTION] ? COL_OK : COL_DIM, "%s Motion estimation (4 block-matching passes)", rd[FEED_MOTION] ? "[skipped]" : "[runs]   ");
     ImGui::TextColored(rd[FEED_HDR] ? COL_OK : COL_DIM, "%s Light pickup from the finished image (UI, bloom, grain included)", rd[FEED_HDR] ? "[replaced]" : "[used]   ");
-    ImGui::SetNextItemWidth(ImGui::GetFontSize() * 22.0f);
+    ImGui::TextColored(rd[FEED_SCENE] ? COL_OK : COL_DIM, "%s The effect works on the 3D scene only; UI and fog after it stay untouched", rd[FEED_SCENE] ? "[active]  " : "[off]     ");
+    ImGui::SetNextItemWidth(fit(22.0f));
     edit_setting(g.geom_source, [](int &v) {
         return ImGui::Combo("Geometry source with game normals", &v, "Rebuild from depth everywhere\0Game normals where valid (default)\0Game normals only (fastest)\0");
     });
@@ -540,7 +508,7 @@ static void draw_feeds(effect_runtime *rt)
         char head[128];
         std::snprintf(head, sizeof(head), "%s   [%s]###feed%d", FEED_LABEL[i], badge, i);
         ImGui::PushStyleColor(ImGuiCol_Text, rd[i] ? COL_OK : (f.assigned() && f.enabled ? COL_WARN : ImGui::GetStyleColorVec4(ImGuiCol_Text)));
-        const bool open = ImGui::CollapsingHeader(head, i <= FEED_MOTION ? ImGuiTreeNodeFlags_DefaultOpen : 0);
+        const bool open = ImGui::CollapsingHeader(head, (i <= FEED_MOTION || i == FEED_SCENE) ? ImGuiTreeNodeFlags_DefaultOpen : 0);
         ImGui::PopStyleColor();
         tip(FEED_HELP[i]);
         if (!open)
@@ -568,7 +536,7 @@ static void draw_feeds(effect_runtime *rt)
             }
         }
         else
-            ImGui::TextColored(COL_DIM, "Assign it with Auto-detect, in the Profiler (Use as) or with a layer's Role in the Layers tab.");
+            ImGui::TextColored(COL_DIM, "Assign it in the Profiler (Use as) or with a layer's Role.");
 
         if (f.enabled && f.assigned())
         {
@@ -583,7 +551,7 @@ static void draw_feeds(effect_runtime *rt)
         if (v.handle != 0)
             thumb(v, w, h, s_thumb);
 
-        const float cw = ImGui::GetFontSize() * 20.0f;
+        const float cw = fit(20.0f);
         if (i == FEED_NORMALS)
         {
             ImGui::SetNextItemWidth(cw);
@@ -596,7 +564,7 @@ static void draw_feeds(effect_runtime *rt)
             changed |= ImGui::Checkbox("Flip Y", &f.flip_y);
         }
         if (i == FEED_ALBEDO)
-            ImGui::TextColored(COL_DIM, "Must be base colour, not lit colour. Written through an sRGB view = decoded to linear when sampled.");
+            dim_wrapped("Must be base colour, not lit colour. Written through an sRGB view = decoded to linear when sampled.");
         if (i == FEED_MOTION)
         {
             ImGui::SetNextItemWidth(cw);
@@ -618,7 +586,10 @@ static void draw_feeds(effect_runtime *rt)
                  "diffuse effect (they would need specular GI).");
         }
         if (i == FEED_HDR)
-            ImGui::TextColored(COL_DIM, "Exposure is matched to the image automatically. Check: Debug: G-Buffer & Canvas > Game HDR Scene Light.");
+            dim_wrapped("Exposure is matched to the image automatically. Check: Debug: G-Buffer & Canvas > Game HDR Scene Light.");
+        if (i == FEED_SCENE)
+            dim_wrapped("Pick the last layer (or texture) that holds the finished 3D image before the UI. Check the thumbnail: it must show the "
+                        "game without HUD. It must be as large as the screen and in the back buffer's format.");
         char sync_label[160];
         std::snprintf(sync_label, sizeof(sync_label), "Drive the shader's \"%s\" switch", FEED_SWITCH_LABEL[i]);
         changed |= ImGui::Checkbox(sync_label, &f.sync);
@@ -672,7 +643,13 @@ static void draw_layers(effect_runtime *rt)
         start_recording(180);
     }
     ImGui::SameLine();
-    ImGui::SetNextItemWidth(ImGui::GetFontSize() * 14.0f);
+    if (ImGui::Button("Re-sort"))
+    {
+        std::lock_guard<std::mutex> lock(g.mtx);
+        sort_catalog_locked();
+    }
+    tip("Applies the sort again (new layers are appended at the end until then).");
+    ImGui::SetNextItemWidth(fit(14.0f));
     if (ImGui::Combo("Sort", &sort_mode, SORT_ITEMS))
     {
         std::lock_guard<std::mutex> lock(g.mtx);
@@ -682,28 +659,22 @@ static void draw_layers(effect_runtime *rt)
     }
     help("Frame order: as drawn. Resolution, then frame order: the largest targets first (screen, then render resolution, then smaller), "
          "each group in frame order. Kind: G-buffer, geometry, lighting, transparent, post-process, UI. Ties always keep frame order.");
-    ImGui::SameLine();
-    if (ImGui::Button("Re-sort"))
-    {
-        std::lock_guard<std::mutex> lock(g.mtx);
-        sort_catalog_locked();
-    }
-    tip("Applies the sort again (new layers are appended at the end until then).");
 
+    edit_setting(g.only_always, [](bool &v) { return ImGui::Checkbox("Only layers drawn every frame", &v); });
+    tip("Hides layers that are drawn only sometimes (menus, cut-scenes, weather, effects the camera sees now and then). A layer must be "
+        "drawn in 95% of the frames since it was first seen, for at least a second. Layers with a role are always shown.");
     edit_setting(g.only_useful, [](bool &v) { return ImGui::Checkbox("Hide small targets", &v); });
     tip("Hides targets under a quarter of the screen's width (shadow maps, bloom mips, ...).");
-    ImGui::SameLine();
     edit_setting(g.cat_add_new, [](bool &v) { return ImGui::Checkbox("Add new layers", &v); });
     tip("After a recording, keep adding layers that appear later (new areas, menus) at the end of the list.");
-    ImGui::SameLine();
     static char filter[64] = "";
-    ImGui::SetNextItemWidth(ImGui::GetFontSize() * 14.0f);
+    ImGui::SetNextItemWidth(fit(16.0f));
     ImGui::InputTextWithHint("##filter", "filter: format, size, kind, note", filter, sizeof(filter));
     if (rec_left > 0)
-        ImGui::ProgressBar(1.0f - static_cast<float>(rec_left) / rec_total, ImVec2(ImGui::GetFontSize() * 16.0f, 0.0f), "recording the frame's layers");
-    ImGui::TextColored(COL_DIM, "%zu layers. Click = preview, double-click = render CRCGI there. %s / %s select (hold to scroll), %s render here, %s / %s role.",
-                       cat_size, bound_key(KA_LAYER_PREV).c_str(), bound_key(KA_LAYER_NEXT).c_str(), bound_key(KA_INJECT_HERE).c_str(),
-                       bound_key(KA_ROLE_PREV).c_str(), bound_key(KA_ROLE_NEXT).c_str());
+        ImGui::ProgressBar(1.0f - static_cast<float>(rec_left) / rec_total, ImVec2(-FLT_MIN, 0.0f), "recording the frame's layers");
+    dim_wrapped("%zu layers recorded. Click = preview, double-click = finished frame. Keys: %s / %s select, %s finished frame, %s / %s role.",
+                cat_size, bound_key(KA_LAYER_PREV).c_str(), bound_key(KA_LAYER_NEXT).c_str(), bound_key(KA_FRAME_END_HERE).c_str(),
+                bound_key(KA_ROLE_PREV).c_str(), bound_key(KA_ROLE_NEXT).c_str());
 
     std::vector<Row> rows = build_rows();
     uint64_t frame;
@@ -734,84 +705,58 @@ static void draw_layers(effect_runtime *rt)
         if (contains_ci(targets[i] + " " + n + " " + LK_LABEL[r.kind], filter))
             shown.push_back(static_cast<int>(i));
     }
-    int sel_shown = -1;
-    for (size_t k = 0; k < shown.size(); k++)
-        if (shown[k] == sel) sel_shown = static_cast<int>(k);
 
-    const ImGuiTableFlags tf = ImGuiTableFlags_ScrollY | ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_BordersOuter |
-                               ImGuiTableFlags_Resizable | ImGuiTableFlags_SizingStretchProp;
-    if (ImGui::BeginTable("layers", 6, tf, ImVec2(0.0f, ImGui::GetTextLineHeightWithSpacing() * 16.0f)))
+    // One card per layer: id, target and kind on the first line, the note under it, the role last. Scrolls inside its own window.
+    const float fs = ImGui::GetFontSize();
+    if (ImGui::BeginChild("layers_list", ImVec2(0.0f, fs * 24.0f), true))
     {
-        const float fs = ImGui::GetFontSize();
-        ImGui::TableSetupScrollFreeze(0, 1);
-        ImGui::TableSetupColumn("#", ImGuiTableColumnFlags_WidthFixed, fs * 3.2f);
-        ImGui::TableSetupColumn("Target", ImGuiTableColumnFlags_WidthStretch, 1.5f);
-        ImGui::TableSetupColumn("Kind", ImGuiTableColumnFlags_WidthFixed, fs * 6.0f);
-        ImGui::TableSetupColumn("Draws", ImGuiTableColumnFlags_WidthFixed, fs * 3.2f);
-        ImGui::TableSetupColumn("Notes", ImGuiTableColumnFlags_WidthStretch, 2.6f);
-        ImGui::TableSetupColumn("Role", ImGuiTableColumnFlags_WidthFixed, fs * 9.5f);
-        ImGui::TableHeadersRow();
-        ImGuiListClipper clip;
-        clip.Begin(static_cast<int>(shown.size()));
-        if (scroll && sel_shown >= 0)
-            clip.IncludeItemByIndex(sel_shown);
-        while (clip.Step())
-            for (int k = clip.DisplayStart; k < clip.DisplayEnd; k++)
-            {
-                const int i = shown[k];
-                const Row &r = rows[i];
-                const bool live = r.last_seen + 2 >= frame;
-                ImGui::TableNextRow();
-                ImGui::PushID(i);
-                if (!live)
-                    ImGui::PushStyleColor(ImGuiCol_Text, COL_DIM);
-                ImGui::TableSetColumnIndex(0);
-                char id[24];
-                std::snprintf(id, sizeof(id), "%u.%d", r.p.order, r.slot);
-                if (ImGui::Selectable(id, i == sel, ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowOverlap | ImGuiSelectableFlags_AllowDoubleClick))
-                {
-                    select_row(rows, i);
-                    if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))
-                        apply_role(r.p, r.slot, ROLE_INJECT);
-                }
-                if (scroll && i == sel)
-                    ImGui::SetScrollHereY(0.5f);
-                if (ImGui::BeginItemTooltip())
-                {
-                    ImGui::Text("%s", layer_name(r.p, r.slot).c_str());
-                    ImGui::Text("%u draws (%u blended, %u writing depth), pixel shader %08X, %s depth buffer", r.p.draws, r.p.blend_draws, r.p.zwrite_draws,
-                                r.p.ps, r.p.depth.handle ? "with" : "no");
-                    ImGui::Text("Kind: %s.  Position in the frame: %.0f%%.  Seen in %u frames.", LK_LABEL[r.kind], r.pos * 100.0f, r.seen);
-                    if (!notes[i].empty())
-                        ImGui::Text("%s", notes[i].c_str());
-                    ImGui::TextColored(COL_DIM, "Click: preview below.  Double-click: render CRCGI before this layer.");
-                    ImGui::EndTooltip();
-                }
-                ImGui::TableSetColumnIndex(1);
-                ImGui::TextUnformatted(targets[i].c_str());
-                ImGui::TableSetColumnIndex(2);
-                ImGui::TextColored(live ? LK_COLOR[r.kind] : COL_DIM, "%s", LK_LABEL[r.kind]);
-                ImGui::TableSetColumnIndex(3);
-                ImGui::Text("%u", r.p.draws);
-                ImGui::TableSetColumnIndex(4);
-                ImGui::TextUnformatted(notes[i].c_str());
-                ImGui::TableSetColumnIndex(5);
-                int role = role_of(r.p, r.slot), nr = role;
-                ImGui::SetNextItemWidth(-FLT_MIN);
-                if (ImGui::Combo("##role", &nr, ROLE_ITEMS) && nr != role)
-                    apply_role(r.p, r.slot, nr);
-                if (!live)
-                    ImGui::PopStyleColor();
-                ImGui::PopID();
-            }
-        if (shown.empty())
+        int drawn = 0;
+        for (size_t k = 0; k < shown.size() && drawn < 300; k++, drawn++)
         {
-            ImGui::TableNextRow();
-            ImGui::TableSetColumnIndex(1);
-            ImGui::TextDisabled(rows.empty() ? "Nothing recorded yet." : "No layer matches the filter.");
+            const int i = shown[k];
+            const Row &r = rows[i];
+            const bool live = r.last_seen + 2 >= frame;
+            ImGui::PushID(i);
+            if (!live)
+                ImGui::PushStyleColor(ImGuiCol_Text, COL_DIM);
+            char head[160];
+            std::snprintf(head, sizeof(head), "#%u.%d   %s   %u draws", r.p.order, r.slot, targets[i].c_str(), r.p.draws);
+            if (ImGui::Selectable(head, i == sel, ImGuiSelectableFlags_AllowDoubleClick))
+            {
+                select_row(rows, i);
+                if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))
+                    apply_role(r.p, r.slot, ROLE_SCENE);
+            }
+            if (scroll && i == sel)
+                ImGui::SetScrollHereY(0.5f);
+            if (ImGui::BeginItemTooltip())
+            {
+                ImGui::Text("%s", layer_name(r.p, r.slot).c_str());
+                ImGui::Text("%u draws (%u blended, %u writing depth), pixel shader %08X, %s depth buffer", r.p.draws, r.p.blend_draws, r.p.zwrite_draws,
+                            r.p.ps, r.p.depth.handle ? "with" : "no");
+                ImGui::Text("Kind: %s.  Position in the frame: %.0f%%.  Seen in %u frames.", LK_LABEL[r.kind], r.pos * 100.0f, r.seen);
+                ImGui::TextColored(COL_DIM, "Click: preview below.  Double-click: use as the finished frame.");
+                ImGui::EndTooltip();
+            }
+            ImGui::TextColored(live ? LK_COLOR[r.kind] : COL_DIM, "%s", LK_LABEL[r.kind]);
+            if (!notes[i].empty())
+            {
+                ImGui::SameLine();
+                ImGui::TextDisabled("%s", notes[i].c_str());
+            }
+            int role = role_of(r.p, r.slot), nr = role;
+            ImGui::SetNextItemWidth(-FLT_MIN);
+            if (ImGui::Combo("##role", &nr, ROLE_ITEMS) && nr != role)
+                apply_role(r.p, r.slot, nr);
+            if (!live)
+                ImGui::PopStyleColor();
+            ImGui::Separator();
+            ImGui::PopID();
         }
-        ImGui::EndTable();
+        if (shown.empty())
+            ImGui::TextDisabled(rows.empty() ? "Nothing recorded yet (or no layer is drawn in every frame)." : "No layer matches the filter.");
     }
+    ImGui::EndChild();
 
     // preview of the selected layer
     DevState *ds = rt->get_device()->get_private_data<DevState>();
@@ -831,76 +776,71 @@ static void draw_layers(effect_runtime *rt)
         pstatus = ds->preview.status;
     }
     if (sel >= 0)
-        ImGui::Text("Selected: %s  (%s)", layer_name(rows[sel].p, rows[sel].slot).c_str(), LK_LABEL[rows[sel].kind]);
+        ImGui::TextWrapped("Selected: %s  (%s)", layer_name(rows[sel].p, rows[sel].slot).c_str(), LK_LABEL[rows[sel].kind]);
     if (srv.handle != 0)
-        thumb(srv, pw, ph, std::min(ImGui::GetContentRegionAvail().x, ImGui::GetFontSize() * 26.0f));
+        thumb(srv, pw, ph, std::min(ImGui::GetContentRegionAvail().x, fs * 26.0f));
     else if (rt->get_device()->get_api() == device_api::vulkan)
-        ImGui::TextColored(COL_DIM, "No live preview on Vulkan (nothing can be copied inside a render pass): the Profiler shows the textures.");
+        dim_wrapped("No live preview on Vulkan (nothing can be copied inside a render pass): the Profiler shows the textures.");
     else if (!pstatus.empty())
-        ImGui::TextColored(COL_DIM, "No preview: %s", pstatus.c_str());
+        dim_wrapped("No preview: %s", pstatus.c_str());
     else if (sel >= 0 && rows[sel].last_seen + 2 < frame)
-        ImGui::TextColored(COL_DIM, "No preview: this layer is not drawn at the moment.");
+        dim_wrapped("No preview: this layer is not drawn at the moment.");
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
 // Profiler: the game's render-target textures, as a table
 // ---------------------------------------------------------------------------------------------------------------------
-static void score_bar(const char *name, float v)
+// One score as a label and a bar that fills the card's width (the scores stack vertically instead of sitting side by side).
+static void score_row(const char *name, float v, bool suggested)
 {
+    const float fs = ImGui::GetFontSize();
     char b[32];
-    std::snprintf(b, sizeof(b), "%s %.2f", name, v);
+    std::snprintf(b, sizeof(b), "%.2f", v);
+    ImGui::TextColored(suggested ? COL_OK : COL_DIM, "%-11s", name);
+    ImGui::SameLine(fs * 7.5f);
     ImGui::PushStyleColor(ImGuiCol_PlotHistogram, v >= 0.6f ? COL_OK : (v > 0.0f ? COL_WARN : COL_DIM));
-    ImGui::ProgressBar(std::clamp(v, 0.0f, 1.0f), ImVec2(ImGui::GetFontSize() * 6.5f, ImGui::GetFontSize() * 1.05f), b);
+    ImGui::ProgressBar(std::clamp(v, 0.0f, 1.0f), ImVec2(-FLT_MIN, fs * 0.85f), b);
     ImGui::PopStyleColor();
 }
 
 static void draw_profiler()
 {
+    const float fs = ImGui::GetFontSize();
     if (ImGui::Button("Take snapshot"))
-        pool_request_snapshot(false);
-    tip("Copies each candidate texture once (where its state is known) and analyses 16 tiles of it. Nothing is assigned.");
-    ImGui::SameLine();
-    if (ImGui::Button("Auto-detect and assign"))
-        pool_request_snapshot(true, true);
-    tip("Snapshot + analysis, then the best texture per feed is assigned, replacing earlier choices.");
-    ImGui::SameLine();
-    if (ImGui::Button("Re-assign from the last analysis"))
-        auto_assign_from_analysis(true);
+        pool_request_snapshot();
+    tip("Copies each candidate texture once (where its state is known) and analyses 16 tiles of it. The scores are suggestions: nothing is "
+        "assigned until you press Use as.");
     ImGui::SameLine();
     if (ImGui::Button("Release snapshots"))
         pool_release_snapshots();
     tip("Frees the video memory of the snapshot copies.");
 
     static bool show_unused = false;
-    static int order = 0;
+    static int order = 1;
     int filter, limit;
     {
         std::lock_guard<std::mutex> lock(prof.m);
         filter = prof.filter;
         limit = prof.snap_limit;
     }
-    const float fs = ImGui::GetFontSize();
-    ImGui::SetNextItemWidth(fs * 17.0f);
+    ImGui::SetNextItemWidth(fit(17.0f));
     if (ImGui::Combo("Size", &filter, "All render targets\0Screen aspect, a third of its size or more\0Screen or render (upscaler) size\0"))
     {
         std::lock_guard<std::mutex> lock(prof.m);
         prof.filter = filter;
     }
-    ImGui::SameLine();
-    ImGui::SetNextItemWidth(fs * 9.0f);
+    ImGui::SetNextItemWidth(fit(9.0f));
     ImGui::Combo("Order", &order, "Frame order\0Best score\0Largest first\0");
-    ImGui::SameLine();
-    ImGui::SetNextItemWidth(fs * 7.0f);
+    ImGui::SetNextItemWidth(fit(9.0f));
     if (ImGui::SliderInt("Snapshots", &limit, 4, 48))
     {
         std::lock_guard<std::mutex> lock(prof.m);
         prof.snap_limit = limit;
     }
     tip("How many textures (most drawn first) are copied per snapshot.");
-    ImGui::SameLine();
     ImGui::Checkbox("Show unused", &show_unused);
     ImGui::SameLine();
-    ImGui::SetNextItemWidth(fs * 7.0f);
+    ImGui::SetNextItemWidth(fit(7.0f));
     ImGui::SliderFloat("##thumb", &s_thumb, 96.0f, 320.0f, "%.0f px");
 
     std::vector<PoolTex> items;
@@ -918,7 +858,7 @@ static void draw_profiler()
             busy |= t.rb_state == 1 || t.rb_state == 2;
             if (!pool_candidate_size(t, filter))
                 continue;
-            if (!show_unused && t.l_binds == 0 && t.snap.res.handle == 0)
+            if (!show_unused && t.l_binds == 0 && t.l_dispatches == 0 && t.snap.res.handle == 0)
                 continue;
             items.push_back(t);
         }
@@ -935,68 +875,70 @@ static void draw_profiler()
         if ((a.l_binds > 0) != (b.l_binds > 0)) return a.l_binds > 0;
         return a.l_order != b.l_order ? a.l_order < b.l_order : a.seq < b.seq;
     });
-    ImGui::TextColored(COL_DIM, "%zu textures. Snapshots use %.1f MB of video memory.%s", items.size(), vram / (1024.0 * 1024.0),
+    ImGui::TextColored(COL_DIM, "%zu textures, snapshots use %.1f MB.%s", items.size(), vram / (1024.0 * 1024.0),
                        phase ? "  Capturing..." : (busy ? "  Analysing..." : ""));
     help("Textures come from the game's own creation calls, so this also works where descriptor heaps hide the bindings (Direct3D 12, "
-         "Vulkan). Copies are taken where the texture's state is known: after a binding in which it was a render target, or right after the "
-         "game's own barrier out of that state. Direct3D 12 games often place several targets in the same memory (aliasing): a snapshot is "
-         "therefore taken right when the texture was written, and a texture that holds something else later in the frame still analyses "
-         "correctly.");
+         "Vulkan). Copies are taken where the texture's state is known: after a binding in which it was a render target (Direct3D 12 "
+         "also right after a render pass ended), or on Vulkan right after the game's own barrier out of that state. Games that place "
+         "several targets in the same memory (aliasing) are handled: the copy is taken at the texture's main binding.");
 
+    Suggestion best[FEED_COUNT];
+    profiler_suggestions(best);
     FeedConfig fc[FEED_COUNT];
     {
         std::lock_guard<std::mutex> lock(g.mtx);
         for (int i = 0; i < FEED_COUNT; i++)
             fc[i] = g.feed[i];
     }
-    const ImGuiTableFlags tf = ImGuiTableFlags_ScrollY | ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_BordersOuter |
-                               ImGuiTableFlags_Resizable | ImGuiTableFlags_SizingStretchProp;
-    if (ImGui::BeginTable("pool", 4, tf, ImVec2(0.0f, fs * 30.0f)))
+    if (!items.empty() && phase == 0 && !busy)
     {
-        ImGui::TableSetupScrollFreeze(0, 1);
-        ImGui::TableSetupColumn("Snapshot", ImGuiTableColumnFlags_WidthFixed, s_thumb + 8.0f);
-        ImGui::TableSetupColumn("Texture", ImGuiTableColumnFlags_WidthStretch, 1.2f);
-        ImGui::TableSetupColumn("Analysis", ImGuiTableColumnFlags_WidthStretch, 1.6f);
-        ImGui::TableSetupColumn("Use as", ImGuiTableColumnFlags_WidthFixed, fs * 11.0f);
-        ImGui::TableHeadersRow();
+        bool any = false;
+        for (int f = 0; f < FEED_COUNT; f++)
+            any |= best[f].have && !(!UI_MATERIAL && f == FEED_MATERIAL);
+        if (!any)
+            dim_wrapped("No clear suggestion yet. Take a snapshot while the scene is on screen.");
+    }
+
+    const float cw = ImGui::GetContentRegionAvail().x;
+    if (ImGui::BeginChild("pool_list", ImVec2(cw, fs * 34.0f), true))
+    {
         for (size_t i = 0; i < items.size(); i++)
         {
             const PoolTex &t = items[i];
-            ImGui::TableNextRow();
             ImGui::PushID(static_cast<int>(i));
-            ImGui::TableSetColumnIndex(0);
-            if (t.snap.srv.handle != 0)
-                thumb(t.snap.srv, t.snap.w, t.snap.h, s_thumb);
-            else
-                ImGui::TextDisabled("(no snapshot)");
-            ImGui::TableSetColumnIndex(1);
-            ImGui::Text("%s", fmt_name(t.view_fmt != format::unknown ? t.view_fmt : t.fmt));
-            ImGui::Text("%u x %u  #%u%s", t.sig.w, t.sig.h, t.sig.ordinal, t.sig.samples > 1 ? "  MSAA" : "");
+            ImGui::TextColored(COL_HEAD, "%s   %u x %u   #%u%s", fmt_name(t.view_fmt != format::unknown ? t.view_fmt : t.fmt), t.sig.w, t.sig.h, t.sig.ordinal,
+                               t.sig.samples > 1 ? "   MSAA" : "");
             if (t.sig.w != g.bb_w && screen_sized(t.sig.w, t.sig.h))
-                ImGui::TextColored(COL_HEAD, "render resolution");
+            {
+                ImGui::SameLine();
+                ImGui::TextColored(COL_DIM, "render res.");
+            }
             for (int f = 0; f < FEED_COUNT; f++)
                 if (fc[f].source == SRC_TEXTURE && fc[f].tex == t.sig)
                     ImGui::TextColored(COL_OK, "assigned: %s", FEED_LABEL[f]);
-            ImGui::PushStyleColor(ImGuiCol_Text, COL_DIM);
-            if (t.l_binds > 0)
-                ImGui::TextWrapped("drawn in %u binding(s), %u draws, up to %u targets at once, slot %u%s", t.l_binds, t.l_draws, t.l_mrt, t.l_slot,
-                                   t.l_depth ? ", with depth" : "");
+            if (t.snap.srv.handle != 0)
+                thumb(t.snap.srv, t.snap.w, t.snap.h, std::min(s_thumb, ImGui::GetContentRegionAvail().x));
             else
-                ImGui::TextWrapped("not drawn to in the last frame");
-            ImGui::PopStyleColor();
-            ImGui::TableSetColumnIndex(2);
+                ImGui::TextDisabled("(no snapshot)");
+            if (t.l_binds > 0)
+                dim_wrapped("%u binding(s), %u draws, up to %u targets at once, slot %u%s", t.l_binds, t.l_draws, t.l_mrt, t.l_slot, t.l_depth ? ", with depth" : "");
+            else if (t.l_dispatches > 0)
+                dim_wrapped("written by %u compute dispatch(es)", t.l_dispatches);
+            else
+                dim_wrapped("not drawn to in the last frame");
             if (t.an.done && t.an.error.empty())
             {
                 ImGui::TextWrapped("%s", t.an.label.c_str());
-                score_bar("normals", t.an.s_normal);
-                ImGui::SameLine();
-                score_bar("albedo", t.an.s_albedo);
-                score_bar("motion", t.an.s_motion);
-                ImGui::SameLine();
-                score_bar("HDR light", t.an.s_hdr);
-                if (UI_MATERIAL && t.an.s_material > 0.0f)
-                    score_bar("material?", t.an.s_material);
-                ImGui::TextColored(COL_DIM, "unit vectors %.0f%%, above 1: %.0f%%", t.an.unit_frac * 100.0f, t.an.hdr_frac * 100.0f);
+                for (int f = 0; f < FEED_COUNT; f++)
+                {
+                    if (!UI_MATERIAL && f == FEED_MATERIAL)
+                        continue;
+                    const float v = t.an.score(f);
+                    if (v <= 0.0f && !(best[f].have && best[f].res == t.res))
+                        continue;                                           // only the scores that matter for this texture
+                    score_row(FEED_LABEL[f], v, best[f].have && best[f].res == t.res);
+                }
+                dim_wrapped("unit vectors %.0f%%, above 1: %.0f%%, mean brightness %.2f", t.an.unit_frac * 100.0f, t.an.hdr_frac * 100.0f, t.an.luma_mean);
             }
             else if (!t.an.error.empty())
                 ImGui::TextColored(COL_WARN, "%s", t.an.error.c_str());
@@ -1004,26 +946,27 @@ static void draw_profiler()
                 ImGui::TextColored(COL_DIM, "analysing...");
             else
                 ImGui::TextDisabled("not analysed (Take snapshot)");
-            ImGui::TableSetColumnIndex(3);
+            // Use as: buttons that wrap to the next line when the window is narrow
+            const float x_end = ImGui::GetCursorScreenPos().x + ImGui::GetContentRegionAvail().x;
+            bool first = true;
             for (int f = 0; f < FEED_COUNT; f++)
             {
                 if (!UI_MATERIAL && f == FEED_MATERIAL)
                     continue;
-                char b[48];
-                std::snprintf(b, sizeof(b), "%s", FEED_LABEL[f]);
-                if (ImGui::Button(b, ImVec2(-FLT_MIN, 0.0f)))
+                const float w = ImGui::CalcTextSize(FEED_LABEL[f]).x + ImGui::GetStyle().FramePadding.x * 2.0f;
+                if (!first && ImGui::GetItemRectMax().x + ImGui::GetStyle().ItemSpacing.x + w < x_end)
+                    ImGui::SameLine();
+                first = false;
+                if (ImGui::Button(FEED_LABEL[f]))
                     assign_texture_feed(f, t);
             }
+            ImGui::Separator();
             ImGui::PopID();
         }
         if (items.empty())
-        {
-            ImGui::TableNextRow();
-            ImGui::TableSetColumnIndex(1);
             ImGui::TextDisabled("No textures in this size class were drawn to in the last frame. Try \"All render targets\".");
-        }
-        ImGui::EndTable();
     }
+    ImGui::EndChild();
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -1119,9 +1062,9 @@ static void draw_keys(effect_runtime *rt)
         g.key_capture = -1;
         g.dirty = true;
     }
-    ImGui::SetNextItemWidth(ImGui::GetFontSize() * 12.0f);
+    ImGui::SetNextItemWidth(fit(12.0f));
     edit_setting(g.repeat_delay_ms, [](int &v) { return ImGui::SliderInt("Hold delay before repeating (ms)", &v, 100, 1500); });
-    ImGui::SetNextItemWidth(ImGui::GetFontSize() * 12.0f);
+    ImGui::SetNextItemWidth(fit(12.0f));
     edit_setting(g.repeat_rate_ms, [](int &v) { return ImGui::SliderInt("Repeat interval (ms)", &v, 15, 500); });
     tip("While a repeating key is held: the layer selection moves one row per interval.");
 }
@@ -1143,14 +1086,14 @@ static void draw_debug(effect_runtime *rt)
         frame = g.frame; inj_frame = g.injected_frame; trk = g.tracker_report; status = g.status; cat = g.catalog.size(); rec = g.rec_left;
         lists = g.last_list_count;
     }
-    ImGui::Text("Frame %llu   in-frame injections %llu (refused %llu), last %s", static_cast<unsigned long long>(frame),
+    ImGui::TextWrapped("Frame %llu   forced renders %llu (refused %llu), last %s", static_cast<unsigned long long>(frame),
                 static_cast<unsigned long long>(ninj), static_cast<unsigned long long>(nref),
                 inj_frame == ~0ull ? "never" : (std::to_string(frame - inj_frame) + " frame(s) ago").c_str());
-    ImGui::Text("Feed captures: %llu at binding ends, %llu at the game's barriers; %llu frames with feeds bound at the end of the frame",
+    ImGui::TextWrapped("Feed captures: %llu at binding ends, %llu at the game's barriers (Vulkan); %llu frames with feeds bound at the end of the frame",
                 static_cast<unsigned long long>(nci), static_cast<unsigned long long>(ncb), static_cast<unsigned long long>(neof));
-    ImGui::Text("Layer catalog: %zu layers%s, %u command list(s) in the last frame", cat, rec > 0 ? " (recording)" : "", lists);
+    ImGui::TextWrapped("Layer catalog: %zu layers%s, %u command list(s) in the last frame", cat, rec > 0 ? " (recording)" : "", lists);
     if (rt->get_device()->get_api() == device_api::d3d12)
-        ImGui::TextWrapped("D3D12 state tracker at the injection layer: %s", trk.empty() ? "not used yet" : trk.c_str());
+        ImGui::TextWrapped("D3D12 state tracker at the forced layer: %s", trk.empty() ? "not used yet" : trk.c_str());
     if (!status.empty())
         ImGui::TextColored(COL_WARN, "Last status: %s", status.c_str());
 
@@ -1158,7 +1101,7 @@ static void draw_debug(effect_runtime *rt)
     DevState *ds = rt->get_device()->get_private_data<DevState>();
     if (ds != nullptr)
     {
-        const float w0 = ImGui::GetFontSize() * 11.0f;
+        const float w0 = std::min(ImGui::GetFontSize() * 11.0f, ImGui::GetContentRegionAvail().x * 0.48f);
         int per_row = std::max(1, static_cast<int>(ImGui::GetContentRegionAvail().x / (w0 + ImGui::GetStyle().ItemSpacing.x)));
         for (int i = 0; i < FEED_COUNT; i++)
         {
@@ -1185,38 +1128,134 @@ static void draw_debug(effect_runtime *rt)
     }
     ImGui::PushStyleColor(ImGuiCol_Text, COL_DIM);
     ImGui::TextWrapped("Other effects can read the same textures: texture2D t : NORMAL;  : CRCGI_ALBEDO;  : CRCGI_MOTION;  "
-                       ": CRCGI_HDRSCENE;. In the shader, Debug: G-Buffer & Canvas shows each input, the normal fit, the off-screen canvas "
-                       "and the light that comes from it alone.");
+                       ": CRCGI_HDRSCENE;  : CRCGI_SCENE;. In the shader, Debug: G-Buffer & Canvas shows each input, the normal fit, the "
+                       "off-screen canvas and the light that comes from it alone.");
     ImGui::PopStyleColor();
 }
 
-static void draw_options()
+// Shareable target listings: crcgi_targets*.ini next to the game's executable.
+static std::string s_share_msg;
+
+static std::string exe_stem()
 {
-    edit_setting(g.fallback_end, [](bool &v) { return ImGui::Checkbox("Fall back to the end of the frame when the layer is not drawn", &v); });
-    tip("Menus and loading screens often skip the injection layer. On: the effect then runs at the end of the frame. Off: not at all.");
-    edit_setting(g.depth_live, [](bool &v) { return ImGui::Checkbox("Hand the depth buffer in use at the layer to the shader", &v); });
+    char exe[MAX_PATH] = {};
+    GetModuleFileNameA(nullptr, exe, MAX_PATH);
+    std::string name = exe;
+    const size_t slash = name.find_last_of("\\/");
+    if (slash != std::string::npos)
+        name = name.substr(slash + 1);
+    const size_t dot = name.find_last_of('.');
+    return dot == std::string::npos ? name : name.substr(0, dot);
+}
+
+static void draw_share()
+{
+    std::string author, notes;
+    {
+        std::lock_guard<std::mutex> lock(g.mtx);
+        author = g.profile_author;
+        notes = g.profile_notes;
+    }
+    char abuf[128], nbuf[420];
+    std::snprintf(abuf, sizeof(abuf), "%s", author.c_str());
+    std::snprintf(nbuf, sizeof(nbuf), "%s", notes.c_str());
+    ImGui::SetNextItemWidth(fit(18.0f));
+    if (ImGui::InputText("Author", abuf, sizeof(abuf)))
+    {
+        std::lock_guard<std::mutex> lock(g.mtx);
+        g.profile_author = abuf;
+        g.dirty = true;
+    }
+    ImGui::SetNextItemWidth(-FLT_MIN);
+    if (ImGui::InputTextWithHint("##notes", "notes shown to whoever imports this listing (game version, API, what was checked)", nbuf, sizeof(nbuf)))
+    {
+        std::lock_guard<std::mutex> lock(g.mtx);
+        g.profile_notes = nbuf;
+        g.dirty = true;
+    }
+    const std::filesystem::path dir = module_directory();
+    if (ImGui::Button("Export the target listing"))
+    {
+        std::string err;
+        std::lock_guard<std::mutex> lock(g.mtx);
+        const std::filesystem::path file = dir / (L"crcgi_targets_" + std::filesystem::path(exe_stem()).wstring() + L".ini");
+        s_share_msg = write_file_locked(file, true, err) ? "Written: " + file.filename().u8string() : err;
+    }
+    tip("Writes crcgi_targets_<game>.ini next to the executable: the feeds (textures by format, usage, creation order and size relative to "
+        "the screen, so they are found again at another screen resolution), the level, the upscaler setting and your notes. No keys, no "
+        "overlay settings, no forced-render layer. Share it together with a preset.");
+    dim_wrapped("To use a listing someone else made: copy their crcgi_targets*.ini next to the game's executable, press Import.");
+    std::vector<std::filesystem::path> files;
+    std::error_code ec;
+    if (!dir.empty())
+        for (std::filesystem::directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec))
+        {
+            const std::filesystem::path f = it->path();
+            if (f.extension() == L".ini" && f.filename().wstring().rfind(L"crcgi_targets", 0) == 0)
+                files.push_back(f);
+            if (files.size() >= 16)
+                break;
+        }
+    for (size_t i = 0; i < files.size(); i++)
+    {
+        ImGui::PushID(static_cast<int>(i));
+        if (ImGui::Button("Import"))
+        {
+            std::string err;
+            std::lock_guard<std::mutex> lock(g.mtx);
+            if (read_config_locked(files[i], true, err))
+            {
+                g.dirty = true;
+                if (g.level < LEVEL_C) g.level = LEVEL_C;
+                s_share_msg = "Imported " + files[i].filename().u8string() + ". The textures are matched as the game creates them.";
+            }
+            else
+                s_share_msg = err;
+        }
+        ImGui::SameLine();
+        ImGui::TextUnformatted(files[i].filename().u8string().c_str());
+        ImGui::PopID();
+    }
+    if (files.empty())
+        ImGui::TextDisabled("No crcgi_targets*.ini found next to the executable.");
+    if (!s_share_msg.empty())
+        dim_wrapped("%s", s_share_msg.c_str());
+}
+
+static void draw_options(effect_runtime *rt)
+{
+    if (ImGui::CollapsingHeader("Share this game's target listing", ImGuiTreeNodeFlags_DefaultOpen))
+        draw_share();
     edit_setting(g.cross_list_feeds, [](bool &v) { return ImGui::Checkbox("Accept feeds recorded on another command list", &v); });
     tip("Direct3D 12 games record the G-buffer and the lighting on different command lists. On: their copies are used anyway (the GPU "
         "order is the game's submission order, which is G-buffer first in practice).");
-    edit_setting(g.d3d12_inject, [](bool &v) { return ImGui::Checkbox("Direct3D 12: in-frame injection (experimental)", &v); });
-    tip("The add-on records the game's Direct3D 12 state and restores it after the effect. If a game crashes as soon as a layer is "
-        "chosen, switch this off: level C then works at the end of the frame. Layers drawn inside a render pass, or whose state cannot "
-        "be fully recorded, are refused with the reason.");
+    if (ImGui::CollapsingHeader("Force render (advanced)"))
+    {
+        dim_wrapped("The default is to let ReShade run the effect at the end of the frame and to use the finished-frame feed to leave the UI "
+                    "and fog alone. Force render instead makes the add-on render the effect INSIDE the frame, right before the layer with the "
+                    "role \"Force render here\" (Layers tab), with the depth buffer in use there. It changes the game's command stream, so "
+                    "it is the one place where a game can misbehave: use it only when the default cannot do what you need.");
+        edit_setting(g.force_inject, [](bool &v) { return ImGui::Checkbox("Force render at the chosen layer", &v); });
+        edit_setting(g.fallback_end, [](bool &v) { return ImGui::Checkbox("Fall back to the end of the frame when the layer is not drawn", &v); });
+        tip("Menus and loading screens often skip the layer. On: the effect then runs at the end of the frame. Off: not at all.");
+        edit_setting(g.depth_live, [](bool &v) { return ImGui::Checkbox("Hand the depth buffer in use at the layer to the shader", &v); });
+        edit_setting(g.d3d12_inject, [](bool &v) { return ImGui::Checkbox("Direct3D 12: allow it (experimental)", &v); });
+        tip("The add-on records the game's Direct3D 12 state and restores it after the effect. If a game crashes as soon as a layer is "
+            "chosen, switch this off. Layers drawn inside a render pass, or whose state cannot be fully recorded, are refused with the reason.");
+        draw_techniques(rt);
+    }
     if (ImGui::CollapsingHeader("Performance and asynchronous compute"))
     {
-        ImGui::PushStyleColor(ImGuiCol_Text, COL_DIM);
-        ImGui::TextWrapped("What the add-on does for performance: it hands the shader the game's normals, albedo and motion vectors, which "
-                           "removes the normal rebuild, the reflectance estimate and the motion estimation (G-Buffer tab, 'Shader work "
-                           "saved'). In the shader, Far Cascades: Half-Rate Update halves the cost of the long cascades.\n"
-                           "Asynchronous compute is not possible from a ReShade add-on: ReShade renders every pass of an effect on one "
-                           "graphics command list (render_technique), its API cannot create a compute queue, and a pass cannot be moved "
-                           "to another queue. Splitting the pipeline across queues would need the effect re-implemented natively in the "
-                           "add-on (its own compute pipelines, queue and fences) instead of running it through ReShade.");
-        ImGui::PopStyleColor();
+        dim_wrapped("What the add-on does for performance: it hands the shader the game's normals, albedo and motion vectors, which "
+                    "removes the normal rebuild, the reflectance estimate and the motion estimation (G-Buffer tab, 'Shader work "
+                    "saved'). In the shader, Far Cascades: Half-Rate Update halves the cost of the long cascades.\n"
+                    "Asynchronous compute is not possible from a ReShade add-on: ReShade renders every pass of an effect on one "
+                    "graphics command list (render_technique), its API cannot create a compute queue, and a pass cannot be moved "
+                    "to another queue.");
     }
     if (ImGui::CollapsingHeader("Build"))
-        ImGui::TextColored(COL_DIM, "CRCGI Injector v1, built against ReShade revision %s (ImGui %s), %s.",
-                           CRCGI_RESHADE_REVISION, IMGUI_VERSION, sizeof(void *) == 8 ? "64-bit" : "32-bit");
+        dim_wrapped("CRCGI Injector v1.2, built against ReShade revision %s (ImGui %s), %s.", CRCGI_RESHADE_REVISION, IMGUI_VERSION,
+                    sizeof(void *) == 8 ? "64-bit" : "32-bit");
 }
 
 static void draw_overlay(effect_runtime *rt)
@@ -1231,7 +1270,7 @@ static void draw_overlay(effect_runtime *rt)
         if (ImGui::BeginTabItem("Profiler")) { draw_profiler(); ImGui::EndTabItem(); }
         if (ImGui::BeginTabItem("Keys")) { draw_keys(rt); ImGui::EndTabItem(); }
         if (ImGui::BeginTabItem("Debug")) { draw_debug(rt); ImGui::EndTabItem(); }
-        if (ImGui::BeginTabItem("Options")) { draw_options(); ImGui::EndTabItem(); }
+        if (ImGui::BeginTabItem("Options")) { draw_options(rt); ImGui::EndTabItem(); }
         ImGui::EndTabBar();
     }
     if (ImGui::GetIO().WantTextInput)

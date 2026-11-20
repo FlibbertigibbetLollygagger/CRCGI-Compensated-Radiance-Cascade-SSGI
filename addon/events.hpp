@@ -1,4 +1,8 @@
 // CRCGI Injector - pass tracking, the layer catalog, layer roles, and the ReShade add-on event handlers.
+//
+// How the game is watched (the same set of events ReShade Effect Shader Toggler hooks): every draw, indexed draw, indirect draw and
+// compute dispatch counts as work of the current render-target binding interval, pipeline binds give the shader identities, and render
+// pass / clear / barrier events delimit intervals on the explicit APIs.
 #pragma once
 #include "camera.hpp"
 #include "profiler.hpp"
@@ -106,6 +110,18 @@ static void start_recording(int frames)
     g.rec_total = frames;
 }
 
+// A layer is "always rendered" when it was drawn in at least 95% of the frames since it was first seen, for at least a second of
+// frames, and is still drawn now. Conditional layers (menus, cut-scenes, a weather effect, something the camera sometimes sees) are
+// hidden from the list unless a role is assigned to them or the option is switched off.
+static bool layer_always_rendered(const LayerInfo &li)
+{
+    const uint64_t frame = g.frame;
+    if (li.last_seen + 3 < frame || li.seen < 60)
+        return false;
+    const uint64_t span = frame - li.first_seen + 1;
+    return static_cast<uint64_t>(li.seen) * 20 >= span * 19;
+}
+
 static std::vector<Row> build_rows()
 {
     std::vector<Row> rows;
@@ -116,6 +132,8 @@ static std::vector<Row> build_rows()
         if (it == g.catalog.end())
             continue;
         const LayerInfo &li = it->second;
+        if (g.only_always && !layer_has_role_locked(key) && !layer_always_rendered(li))
+            continue;
         for (uint32_t s = 0; s < li.p.rt_count && s < 8; s++)
             if (row_useful(li.p, static_cast<int>(s), g.only_useful))
             {
@@ -198,7 +216,7 @@ static std::string hint_for(const Pass &p, int slot)
         return "G-buffer member";
     }
     if (full && same_format_family(r.fmt, g.bb_fmt) && slot == 0)
-        return "can be injected into";
+        return p.depth.handle == 0 ? "screen-format colour (can be the finished frame)" : "screen-format colour";
     if (fmt_is_float(r.fmt) && (full || render_res) && slot == 0)
         return render_res ? "floating-point colour at render resolution (maybe HDR scene, before the upscaler)" : "floating-point colour (maybe HDR scene)";
     if (render_res)
@@ -208,100 +226,77 @@ static std::string hint_for(const Pass &p, int slot)
     return std::string();
 }
 
-// Auto-setup. Injection layer: by the policy (before the UI / post-processing / transparent effects), the first layer of that kind in
-// the frame whose target can take the effect (the back buffer's size and format family, single-sampled). Feeds: the profiler's content
-// analysis, replacing what was assigned before. The result is reported (Setup tab and log) so nothing happens silently.
-static std::string choose_injection_layer(bool apply)
-{
-    std::vector<Row> rows = build_rows();
-    std::sort(rows.begin(), rows.end(), [](const Row &a, const Row &b) { return a.pos < b.pos; });
-    int policy;
-    {
-        std::lock_guard<std::mutex> lock(g.mtx);
-        policy = g.inject_policy;
-    }
-    const LayerKind want = policy == IP_BEFORE_POST ? LK_POST : (policy == IP_BEFORE_TRANSPARENT ? LK_TRANSPARENT : LK_UI);
-    auto usable = [](const Row &r) {
-        const RtSlot &s0 = r.p.rt[0];
-        return r.slot == 0 && s0.samples <= 1 && s0.w == g.bb_w && s0.h == g.bb_h && same_format_family(s0.fmt, g.bb_fmt);
-    };
-    int pick = -1;
-    const char *why = "";
-    for (size_t i = 0; i < rows.size() && pick < 0; i++)
-        if (rows[i].kind == want && usable(rows[i]))
-        {
-            pick = static_cast<int>(i);
-            why = LK_LABEL[want];
-        }
-    if (pick < 0 && want != LK_UI)
-        for (size_t i = 0; i < rows.size() && pick < 0; i++)
-            if (rows[i].kind == LK_UI && usable(rows[i]))
-            {
-                pick = static_cast<int>(i);
-                why = "UI / overlay (no usable layer of the chosen kind)";
-            }
-    if (pick < 0)
-    {
-        // Fallback: the last single-target, screen-format layer before the first layer drawn into the back buffer.
-        int first_screen = -1;
-        for (size_t i = 0; i < rows.size(); i++)
-            if (rows[i].slot == 0 && rows[i].p.to_back_buffer) { first_screen = static_cast<int>(i); break; }
-        for (size_t i = 0; i < rows.size(); i++)
-            if (usable(rows[i]) && !rows[i].p.to_back_buffer && (first_screen < 0 || static_cast<int>(i) < first_screen) && rows[i].p.rt_count == 1)
-            {
-                pick = static_cast<int>(i);
-                why = "last screen-format layer before the screen";
-            }
-    }
-    if (pick < 0)
-        return "Injection layer: no usable layer found (none has the back buffer's size and format). The effect runs at the end of the frame.";
-    if (!api_supports_injection(g.api))
-        return std::string("Injection layer: ") + api_name(g.api) + " renders at the end of the frame (no in-frame injection on this API).";
-    if (apply)
-        apply_role(rows[pick].p, 0, ROLE_INJECT);
-    char b[200];
-    std::snprintf(b, sizeof(b), "Injection layer: #%u %s %ux%u, before %s.", rows[pick].p.order, fmt_name(rows[pick].p.rt[0].fmt), rows[pick].p.rt[0].w,
-                  rows[pick].p.rt[0].h, why);
-    return b;
-}
-
-static void auto_suggest()
-{
-    std::string rep = choose_injection_layer(true);
-    pool_request_snapshot(true, true);           // feeds: snapshot, analyse, then assign the winners (replacing earlier choices)
-    std::lock_guard<std::mutex> lock(g.mtx);
-    g.master = true;
-    if (g.level < LEVEL_C)
-        g.level = LEVEL_C;
-    g.auto_report = rep + "  Feeds: analysing...";
-    g.dirty = true;
-    log_msg(reshade::log::level::info, "Auto-setup: " + rep);
-}
-
 // ---------------------------------------------------------------------------------------------------------------------
 // Passes
 // ---------------------------------------------------------------------------------------------------------------------
-static void capture_feed(command_list *cl, DevState &ds, int feed, resource_usage state, const RtSlot &src, bool barrier_path)
+static void capture_feed(command_list *cl, DevState &ds, int feed, resource_usage state, const RtSlot &src, uint64_t key, bool barrier_path)
 {
     std::lock_guard<std::mutex> lock(ds.feed_mutex);
-    if (copy_into(cl, state, ds.feed[feed], src, feed))
+    FeedTex &ft = ds.feed[feed];
+    // One binding per frame feeds a texture: engines reuse transient memory later in the frame for unrelated passes, and a copy of
+    // those would overwrite the G-buffer copy (the picture then flashes). Only a later capture at the SAME binding may replace it.
+    if (ft.frame == g.frame && ft.cap_key != 0 && ft.cap_key != key)
+        return;
+    if (barrier_path && ft.frame == g.frame)
+        return;
+    if (copy_into(cl, state, ft, src, feed))
     {
+        ft.cap_key = key;
         std::lock_guard<std::mutex> l2(g.mtx);
         if (barrier_path) g.n_captures_barrier++;
         else g.n_captures_interval++;
     }
 }
 
+// Takes the captures of one finished binding interval: profiler snapshots, feeds taken from the interval's layer or texture, and the
+// preview. The command list must be outside a render pass.
+static void run_captures(command_list *cl, CmdState &cs, uint64_t key, uint32_t rt_count, const RtSlot *rt, const std::vector<CaptureTodo> &todo,
+                         bool prev, int prev_slot, bool snapshots)
+{
+    if (snapshots)
+        for (uint32_t s = 0; s < rt_count && s < 8; s++)
+            if (rt[s].res.handle != 0)
+                pool_capture(cl, rt[s].res, bound_rt_state(cs, rt[s].res), rt[s].view_fmt);
+    if (todo.empty() && !prev)
+        return;
+    DevState *ds = cl->get_device()->get_private_data<DevState>();
+    if (ds == nullptr)
+        return;
+    for (const CaptureTodo &t : todo)
+        if (t.slot >= 0 && t.slot < 8 && rt[t.slot].res.handle != 0)
+            capture_feed(cl, *ds, t.feed, bound_rt_state(cs, rt[t.slot].res), rt[t.slot], key, false);
+    if (prev && prev_slot >= 0 && prev_slot < static_cast<int>(rt_count) && rt[prev_slot].res.handle != 0)
+    {
+        std::lock_guard<std::mutex> lock(ds->feed_mutex);
+        copy_into(cl, bound_rt_state(cs, rt[prev_slot].res), ds->preview, rt[prev_slot], -1);
+    }
+}
+
+// Pending captures (see PendingCapture) whose moment has come: the command list is outside a render pass again. Stale ones (another
+// frame) are dropped.
+static void flush_pending(command_list *cl, CmdState &cs)
+{
+    if (cs.pending.empty() || cs.in_render_pass)
+        return;
+    std::vector<PendingCapture> list;
+    list.swap(cs.pending);
+    for (const PendingCapture &pc : list)
+        if (pc.frame == g.frame)
+            run_captures(cl, cs, pc.key, pc.rt_count, pc.rt, pc.todo, pc.prev, pc.prev_slot, pc.snapshots);
+}
+
 static void end_pass(command_list *cl, CmdState &cs)
 {
-    struct Todo { int feed; int slot; };
-    std::vector<Todo> todo;
+    std::vector<CaptureTodo> todo;
     bool prev = false;
     int prev_slot = 0;
     uint32_t order = 0;
     cs.pass_open = false;
     device *dev = cl->get_device();
-    const bool can_copy = !cs.in_render_pass && dev->get_api() != device_api::vulkan;
+    const device_api api = dev->get_api();
+    const bool copy_now = !cs.in_render_pass && api != device_api::vulkan;
+    const bool copy_later = cs.in_render_pass && api == device_api::d3d12;   // after EndRenderPass, at the next event of this list
+    std::vector<CaptureTodo> candidates;
     {
         std::lock_guard<std::mutex> lock(g.mtx);
         if (cs.pass_index >= 0 && static_cast<size_t>(cs.pass_index) < g.cur.size() && g.cur[cs.pass_index].key == cs.pass_key)
@@ -312,7 +307,7 @@ static void end_pass(command_list *cl, CmdState &cs)
             g.cur[cs.pass_index].zwrite_draws = cs.zwrite_draws;
             order = g.cur[cs.pass_index].order;
         }
-        if (can_copy && g.master && g.level >= LEVEL_C && api_supports_feeds(g.api))
+        if ((copy_now || copy_later) && g.master && g.level >= LEVEL_C && api_supports_feeds(g.api))
             for (int i = 0; i < FEED_COUNT; i++)
             {
                 const FeedConfig &f = g.feed[i];
@@ -323,31 +318,37 @@ static void end_pass(command_list *cl, CmdState &cs)
                 else if (f.source == SRC_TEXTURE && g.feed_res[i].handle != 0)
                     for (uint32_t s = 0; s < cs.rt_count && s < 8; s++)
                         if (cs.rt[s].res == g.feed_res[i])
-                            todo.push_back({ i, static_cast<int>(s) });
-            }
-        if (can_copy && g.preview_key == cs.pass_key && g.frame <= g.preview_frame + 2)
+                            candidates.push_back({ i, static_cast<int>(s) });
+        }
+        if ((copy_now || copy_later) && g.preview_key == cs.pass_key && g.frame <= g.preview_frame + 2)
         {
             prev = true;
             prev_slot = g.preview_slot;
         }
     }
+    // A texture feed is captured only at the texture's main binding (the one that drew most to it): later bindings of the same memory
+    // belong to unrelated passes. (Checked outside g.mtx: the profiler has its own lock.)
+    for (const CaptureTodo &c : candidates)
+        if (pool_is_main_interval(cs.rt[c.slot].res, cs.pass_key))
+            todo.push_back(c);
     pool_note_interval(cs, order);
-    if (can_copy)
-        for (uint32_t s = 0; s < cs.rt_count && s < 8; s++)
-            if (cs.rt[s].res.handle != 0)
-                pool_capture(cl, cs.rt[s].res, bound_rt_state(cs, cs.rt[s].res), cs.rt[s].view_fmt);
-    if (todo.empty() && !prev)
-        return;
-    DevState *ds = dev->get_private_data<DevState>();
-    if (ds == nullptr)
-        return;
-    for (const Todo &t : todo)
-        if (cs.rt[t.slot].res.handle != 0)
-            capture_feed(cl, *ds, t.feed, bound_rt_state(cs, cs.rt[t.slot].res), cs.rt[t.slot], false);
-    if (prev && prev_slot < static_cast<int>(cs.rt_count) && cs.rt[prev_slot].res.handle != 0)
+    if (copy_now)
+        run_captures(cl, cs, cs.pass_key, cs.rt_count, cs.rt, todo, prev, prev_slot, true);
+    else if (copy_later)
     {
-        std::lock_guard<std::mutex> lock(ds->feed_mutex);
-        copy_into(cl, bound_rt_state(cs, cs.rt[prev_slot].res), ds->preview, cs.rt[prev_slot], -1);
+        PendingCapture pc;
+        pc.frame = g.frame;
+        pc.key = cs.pass_key;
+        pc.rt_count = std::min<uint32_t>(cs.rt_count, 8);
+        for (uint32_t i = 0; i < 8; i++)
+            pc.rt[i] = cs.rt[i];
+        pc.todo = todo;
+        pc.prev = prev;
+        pc.prev_slot = prev_slot;
+        pc.snapshots = true;
+        cs.pending.push_back(std::move(pc));
+        if (cs.pending.size() > 64)
+            cs.pending.erase(cs.pending.begin());
     }
 }
 
@@ -405,10 +406,10 @@ static void begin_pass(command_list *cl, CmdState &cs)
         kd.id[i] = cs.rt[i].res.handle != 0 ? pool_identity(cs.rt[i].res) : 0;
     }
     const uint64_t base = fnv64(&kd, sizeof(kd));
-    if (!explicit_states(dev) && cs.occ_frame != g.frame)
+    if (cs.occ_frame != g.frame)
     {
-        cs.occ.clear();                          // D3D10/11 / OpenGL: one recording per frame
-        cs.occ_frame = g.frame;
+        cs.occ.clear();                          // the occurrence counter restarts every frame on every API (a list that is reused across
+        cs.occ_frame = g.frame;                  // frames without a reset, or recorded in a different order, would drift otherwise)
     }
     const uint32_t occ = cs.occ[base]++;
     uint64_t key = fnv64(&occ, sizeof(occ), base);
@@ -418,6 +419,8 @@ static void begin_pass(command_list *cl, CmdState &cs)
     {
         std::lock_guard<std::mutex> lock(g.mtx);
         p.key = key;
+        p.draws = 1;                             // the interval opens at its first real draw; end_pass stores the final count (a command list that
+                                                 // ends without another binding keeps this one, so its last layer is still listed)
         p.order = static_cast<uint32_t>(g.cur.size());
         p.to_back_buffer = p.rt[0].res.handle != 0 && p.rt[0].res.handle == g.bb_res.handle;
         cs.pass_index = static_cast<int>(g.cur.size());
@@ -425,7 +428,7 @@ static void begin_pass(command_list *cl, CmdState &cs)
         if (g.cur.size() < 65536)
             g.cur.push_back(p);
         g.cur_lists.insert(p.cl);
-        do_inject = g.master && g.level >= LEVEL_B && api_supports_injection(g.api) && g_conflict.empty() && !g.in_eof &&
+        do_inject = g.master && g.level >= LEVEL_B && g.force_inject && api_supports_injection(g.api) && g_conflict.empty() && !g.in_eof &&
                     g.role_ref[ROLE_INJECT].key == key && g.injected_frame != g.frame;
     }
     cs.pass_open = true;
@@ -450,6 +453,22 @@ static void begin_pass(command_list *cl, CmdState &cs)
     inject(cl, cs);
 }
 
+static void sync_frame(CmdState &cs)
+{
+    const uint64_t frame = g.frame;
+    if (cs.frame != frame)
+    {
+        cs.frame = frame;                        // anything still open belongs to an old frame: drop it, never use it as current
+        cs.pass_open = false;
+        cs.pending.clear();
+        cs.dispatches = 0;
+        cs.occ.clear();                          // layer keys count occurrences within one frame's recording
+        cs.occ_frame = frame;
+    }
+}
+
+// A draw call of the current binding interval. Draws that draw nothing (no vertices, no instances) are not work and do not open an
+// interval: engines issue them as placeholders, and they would fill the layer list with empty entries.
 static void on_draw_common(command_list *cl)
 {
     if (t_injecting || g.runtime == nullptr)
@@ -457,16 +476,77 @@ static void on_draw_common(command_list *cl)
     CmdState *cs = cl->get_private_data<CmdState>();
     if (cs == nullptr)
         return;
-    if (cs->frame != g.frame)
-    {
-        cs->frame = g.frame;                     // anything still open belongs to an old frame: drop it, never use it as current
-        cs->pass_open = false;
-    }
+    sync_frame(*cs);
+    flush_pending(cl, *cs);
     if (!cs->pass_open)
         begin_pass(cl, *cs);
     cs->draws++;
     if (cs->blend) cs->blend_draws++;
     if (cs->zwrite && cs->dsv.handle != 0) cs->zwrite_draws++;
+}
+
+// A compute dispatch. It belongs to no render-target interval; what matters is which textures it writes (Direct3D 10 / 11: the unordered
+// access views the game bound, which the API shows). A feed taken from such a texture is copied at the next event of the list (the
+// dispatch has run by then), at the first dispatch that writes it in the frame.
+static void on_dispatch_common(command_list *cl)
+{
+    if (t_injecting || g.runtime == nullptr)
+        return;
+    CmdState *cs = cl->get_private_data<CmdState>();
+    if (cs == nullptr)
+        return;
+    sync_frame(*cs);
+    flush_pending(cl, *cs);
+    cs->dispatches++;
+    device *dev = cl->get_device();
+    if (explicit_states(dev))
+        return;                                  // Direct3D 12 / Vulkan: UAVs live in descriptor heaps, their textures are not visible here
+    bool want[FEED_COUNT] = {};
+    {
+        std::lock_guard<std::mutex> lock(g.mtx);
+        if (g.master && g.level >= LEVEL_C && api_supports_feeds(g.api))
+            for (int i = 0; i < FEED_COUNT; i++)
+                want[i] = g.feed[i].enabled && g.feed[i].source == SRC_TEXTURE && g.feed_res[i].handle != 0;
+    }
+    for (uint32_t u = 0; u < 16; u++)
+    {
+        const resource res = cs->uav[u];
+        if (res.handle == 0)
+            continue;
+        const uint64_t id = fnv64(&res.handle, sizeof(res.handle));
+        const uint32_t occ = cs->occ[id]++;
+        const uint64_t key = fnv64(&occ, sizeof(occ), id) | 1;
+        pool_note_compute(res, key);
+        for (int i = 0; i < FEED_COUNT; i++)
+        {
+            if (!want[i])
+                continue;
+            resource live;
+            {
+                std::lock_guard<std::mutex> lock(g.mtx);
+                live = g.feed_res[i];
+            }
+            if (live != res || !pool_is_main_interval(res, key))
+                continue;
+            resource_desc d = dev->get_resource_desc(res);
+            if (d.type != resource_type::texture_2d)
+                continue;
+            PendingCapture pc;
+            pc.frame = g.frame;
+            pc.key = key;
+            pc.rt_count = 1;
+            pc.rt[0].res = res;
+            pc.rt[0].w = d.texture.width;
+            pc.rt[0].h = d.texture.height;
+            pc.rt[0].samples = d.texture.samples;
+            pc.rt[0].fmt = d.texture.format;
+            pc.rt[0].view_fmt = d.texture.format;
+            pc.todo.push_back({ i, 0 });
+            cs->pending.push_back(std::move(pc));
+            if (cs->pending.size() > 64)
+                cs->pending.erase(cs->pending.begin());
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -541,14 +621,21 @@ static void on_reset_cmd_list(command_list *cl)
     {
         cs->states.clear();
         cs->occ.clear();
+        cs->occ_frame = g.frame;
         cs->trk.clear();
         cs->pass_open = false;
         cs->in_render_pass = false;
+        cs->pending.clear();
+        for (resource &r : cs->uav)
+            r = resource{ 0 };
     }
 }
 
-// Barriers: record the state the game put each resource in, and capture feeds / profiler snapshots right after the game itself moves
-// a texture out of the render-target state (its state is then known exactly: the barrier's new state). D3D12 and Vulkan.
+// Barriers: record the state the game put each resource in. Vulkan only: also capture feeds / profiler snapshots right after the game
+// itself moves a texture out of the render-target state (its state is then known exactly: the barrier's new state), because nothing can
+// be copied inside a render pass there. Direct3D 12 never copies here: the event cannot tell a split barrier's BEGIN_ONLY half from a
+// full transition, and a copy (and the barriers around it) between the two halves is invalid. Direct3D 12 captures happen at the
+// end of a binding interval, or at the next event after a render pass ended (flush_pending).
 static void on_barrier(command_list *cl, uint32_t count, const resource *resources, const resource_usage *old_states, const resource_usage *new_states)
 {
     if (t_injecting)
@@ -556,10 +643,15 @@ static void on_barrier(command_list *cl, uint32_t count, const resource *resourc
     CmdState *cs = cl->get_private_data<CmdState>();
     if (cs == nullptr || resources == nullptr || new_states == nullptr)
         return;
+    sync_frame(*cs);
+    flush_pending(cl, *cs);                       // before the new states are recorded: the resources are still where they were
     for (uint32_t i = 0; i < count; i++)
         if (resources[i].handle != 0)
             cs->states[resources[i].handle] = new_states[i];
     if (old_states == nullptr || cs->in_render_pass)
+        return;
+    device *dev = cl->get_device();
+    if (dev->get_api() != device_api::vulkan)
         return;
     int feed_hit[FEED_COUNT];
     bool any_feed = false;
@@ -580,30 +672,22 @@ static void on_barrier(command_list *cl, uint32_t count, const resource *resourc
                 }
         }
     }
-    // D3D12: the barrier event cannot tell a split barrier's BEGIN_ONLY half from a full transition, so it only supplies copies that no
-    // binding end supplied this frame (games using BeginRenderPass). Vulkan pipeline barriers are never split.
-    const bool d3d12 = cl->get_device()->get_api() == device_api::d3d12;
     for (uint32_t i = 0; i < count; i++)
         if (resources[i].handle != 0 && has_usage(old_states[i], resource_usage::render_target) &&
             !has_usage(new_states[i], resource_usage::render_target) && new_states[i] != resource_usage::undefined)
-            pool_capture(cl, resources[i], new_states[i], format::unknown, d3d12);
+            pool_capture(cl, resources[i], new_states[i], format::unknown, true);
     if (!any_feed)
         return;
-    DevState *ds = cl->get_device()->get_private_data<DevState>();
+    DevState *ds = dev->get_private_data<DevState>();
     if (ds == nullptr)
         return;
-    device *dev = cl->get_device();
     for (int f = 0; f < FEED_COUNT; f++)
     {
         if (feed_hit[f] < 0)
             continue;
-        if (d3d12)
-        {
-            std::lock_guard<std::mutex> lock(ds->feed_mutex);
-            if (ds->feed[f].frame == g.frame)
-                continue;                           // already captured at the end of a binding this frame
-        }
         const resource res = resources[feed_hit[f]];
+        if (!pool_main_seen(res))
+            continue;                                // the texture's main binding has not ended yet in this frame: this is not its picture
         resource_desc d = dev->get_resource_desc(res);
         RtSlot src;
         src.res = res;
@@ -611,13 +695,17 @@ static void on_barrier(command_list *cl, uint32_t count, const resource *resourc
         src.h = d.texture.height;
         src.samples = d.texture.samples;
         src.fmt = d.texture.format;
+        uint64_t key = 0;
         {
             std::lock_guard<std::mutex> lock(prof.m);
             auto it = prof.pool.find(res.handle);
             if (it != prof.pool.end())
+            {
                 src.view_fmt = it->second.view_fmt;
+                key = it->second.l_main_key;
+            }
         }
-        capture_feed(cl, *ds, f, new_states[feed_hit[f]], src, true);
+        capture_feed(cl, *ds, f, new_states[feed_hit[f]], src, key, true);
     }
 }
 
@@ -731,6 +819,7 @@ static void on_bind_pipeline(command_list *cl, pipeline_stage stages, pipeline p
 
 static void set_bindings(command_list *cl, CmdState &cs, uint32_t count, const resource_view *rtvs, resource_view dsv)
 {
+    flush_pending(cl, cs);
     if (cs.pass_open && cs.frame == g.frame)
         end_pass(cl, cs);          // the previous binding interval ends here: capture feeds / preview from its targets
     cs.pass_open = false;
@@ -782,8 +871,69 @@ static bool on_end_render_pass(command_list *cl)
     return false;
 }
 
-static bool on_draw(command_list *cl, uint32_t, uint32_t, uint32_t, uint32_t) { on_draw_common(cl); return false; }
-static bool on_draw_indexed(command_list *cl, uint32_t, uint32_t, uint32_t, int32_t, uint32_t) { on_draw_common(cl); return false; }
+static bool on_draw(command_list *cl, uint32_t vertex_count, uint32_t instance_count, uint32_t, uint32_t)
+{
+    if (vertex_count != 0 && instance_count != 0)
+        on_draw_common(cl);
+    return false;
+}
+
+static bool on_draw_indexed(command_list *cl, uint32_t index_count, uint32_t instance_count, uint32_t, int32_t, uint32_t)
+{
+    if (index_count != 0 && instance_count != 0)
+        on_draw_common(cl);
+    return false;
+}
+
+// GPU-driven geometry: the draw / dispatch arguments live in a buffer the CPU never sees, so the call counts as one unit of work of
+// its kind (a draw_count of 0 is a draw that may draw nothing, and is ignored).
+static bool on_draw_or_dispatch_indirect(command_list *cl, indirect_command type, resource, uint64_t, uint32_t draw_count, uint32_t)
+{
+    switch (type)
+    {
+    case indirect_command::draw:
+    case indirect_command::draw_indexed:
+        if (draw_count != 0)
+            on_draw_common(cl);
+        break;
+    case indirect_command::dispatch:
+        on_dispatch_common(cl);
+        break;
+    default:
+        break;                                    // mesh shaders and ray tracing do not render into the binding interval's targets here
+    }
+    return false;
+}
+
+static bool on_dispatch(command_list *cl, uint32_t group_count_x, uint32_t group_count_y, uint32_t group_count_z)
+{
+    if (group_count_x != 0 && group_count_y != 0 && group_count_z != 0)
+        on_dispatch_common(cl);
+    return false;
+}
+
+// A clear of a bound render target starts a new use of that memory: the interval so far ends (it captures what it drew), the next draw
+// opens a new interval with the same targets. Without this, a game that clears and redraws the same target in one binding would be
+// recorded as a single layer.
+static bool on_clear_render_target_view(command_list *cl, resource_view rtv, const float[4], uint32_t, const rect *)
+{
+    if (t_injecting || g.runtime == nullptr)
+        return false;
+    CmdState *cs = cl->get_private_data<CmdState>();
+    if (cs == nullptr)
+        return false;
+    sync_frame(*cs);
+    flush_pending(cl, *cs);
+    if (!cs->pass_open || cs->in_render_pass)
+        return false;
+    for (uint32_t i = 0; i < cs->rt_count && i < 8; i++)
+        if (cs->rtv[i] == rtv)
+        {
+            end_pass(cl, *cs);                        // pass_open becomes false: the next draw opens a new interval
+            break;
+        }
+    return false;
+}
 
 // Camera probe: constant buffer writes
 static bool on_update_buffer_region(device *, const void *data, resource dest, uint64_t offset, uint64_t size)
@@ -886,6 +1036,8 @@ static void end_frame(effect_runtime *rt)
         const float total = static_cast<float>(std::max<size_t>(g.cur.size(), 1));
         for (const Pass &p : g.cur)
         {
+            if (p.draws == 0)
+                continue;                        // an interval without a real draw is not a layer
             auto it = g.catalog.find(p.key);
             if (it == g.catalog.end())
             {
@@ -905,6 +1057,26 @@ static void end_frame(effect_runtime *rt)
             li.last_seen = g.frame;
             li.pos = li.seen == 0 ? p.order / total : 0.92f * li.pos + 0.08f * (p.order / total);
             li.seen++;
+        }
+        if ((g.frame % 600) == 599)
+        {
+            // Layers not drawn for ten seconds and without a role are dropped (a menu that was open once, a cut-scene): the catalog
+            // stays a list of what the game does now.
+            bool removed = false;
+            for (auto it = g.catalog.begin(); it != g.catalog.end();)
+            {
+                const uint64_t key = it->first;
+                if (it->second.last_seen + 600 < g.frame && !layer_has_role_locked(key))
+                {
+                    it = g.catalog.erase(it);
+                    removed = true;
+                }
+                else
+                    ++it;
+            }
+            if (removed)
+                g.cat_order.erase(std::remove_if(g.cat_order.begin(), g.cat_order.end(), [](uint64_t k) { return g.catalog.count(k) == 0; }),
+                                  g.cat_order.end());
         }
         if (g.rec_left > 0)
         {
@@ -1072,18 +1244,9 @@ static void handle_keys(effect_runtime *rt)
     if (fired[KA_TOGGLE]) { std::lock_guard<std::mutex> l(g.mtx); g.master = !g.master; g.dirty = true; }
     if (fired[KA_LEVEL_DOWN]) { std::lock_guard<std::mutex> l(g.mtx); g.level = std::max(0, g.level - 1); g.dirty = true; }
     if (fired[KA_LEVEL_UP]) { std::lock_guard<std::mutex> l(g.mtx); g.level = std::min(2, g.level + 1); g.dirty = true; }
-    if (fired[KA_AUTO_SETUP])
-        auto_suggest();
-    if (fired[KA_AUTO_FEEDS])
-    {
-        pool_request_snapshot(true, true);
-        std::lock_guard<std::mutex> l(g.mtx);
-        if (g.level < LEVEL_C) g.level = LEVEL_C;
-        g.dirty = true;
-    }
     if (fired[KA_RECORD])
         start_recording(180);
-    if (fired[KA_LAYER_PREV] || fired[KA_LAYER_NEXT] || fired[KA_INJECT_HERE] || fired[KA_ROLE_PREV] || fired[KA_ROLE_NEXT])
+    if (fired[KA_LAYER_PREV] || fired[KA_LAYER_NEXT] || fired[KA_FRAME_END_HERE] || fired[KA_ROLE_PREV] || fired[KA_ROLE_NEXT])
     {
         std::vector<Row> rows = build_rows();
         int idx = selected_index(rows);
@@ -1093,8 +1256,8 @@ static void handle_keys(effect_runtime *rt)
         idx = selected_index(rows);
         if (idx >= 0)
         {
-            if (fired[KA_INJECT_HERE])
-                apply_role(rows[idx].p, rows[idx].slot, ROLE_INJECT);
+            if (fired[KA_FRAME_END_HERE])
+                apply_role(rows[idx].p, rows[idx].slot, ROLE_SCENE);
             if (fired[KA_ROLE_PREV] || fired[KA_ROLE_NEXT])
             {
                 int r = role_of(rows[idx].p, rows[idx].slot);
@@ -1102,49 +1265,6 @@ static void handle_keys(effect_runtime *rt)
                 apply_role(rows[idx].p, rows[idx].slot, r);
             }
         }
-    }
-}
-
-// Auto re-detect: a feed whose texture was destroyed (loading screens recreate the G-buffer) and not re-adopted within half a second,
-// or whose texture stopped being written for 3 seconds while the game renders, triggers a new detection that replaces it.
-static void auto_redetect_check(effect_runtime *rt)
-{
-    bool want = false;
-    bool check_stale[FEED_COUNT] = {};
-    uint64_t frame;
-    {
-        std::lock_guard<std::mutex> lock(g.mtx);
-        if (!g.auto_redetect || !g.master || g.level < LEVEL_C || g.frame < g.redetect_frame + 600)
-            return;
-        frame = g.frame;
-        for (int i = 0; i < FEED_COUNT; i++)
-        {
-            const FeedConfig &f = g.feed[i];
-            if (!f.enabled || f.source != SRC_TEXTURE || !f.tex.valid() || i == FEED_MATERIAL)
-                continue;
-            if (g.feed_res[i].handle == 0 && g.feed_lost_frame[i] != 0 && g.frame > g.feed_lost_frame[i] + 30)
-                want = true;
-            else if (g.feed_res[i].handle != 0)
-                check_stale[i] = true;
-        }
-    }
-    // (feed_mutex is never taken while g.mtx is held: capture_feed takes them in the other order)
-    if (DevState *ds = rt->get_device()->get_private_data<DevState>())
-    {
-        std::lock_guard<std::mutex> l2(ds->feed_mutex);
-        for (int i = 0; i < FEED_COUNT; i++)
-            if (check_stale[i] && ds->feed[i].frame != ~0ull && frame > ds->feed[i].frame + 180)
-                want = true;
-    }
-    if (want)
-    {
-        std::lock_guard<std::mutex> lock(g.mtx);
-        g.redetect_frame = g.frame;
-    }
-    if (want)
-    {
-        log_msg(reshade::log::level::info, "Auto re-detect: an assigned feed texture was lost or went stale (loading screen?); detecting again.");
-        pool_request_snapshot(true, true);
     }
 }
 
@@ -1159,7 +1279,6 @@ static void on_reshade_present(effect_runtime *rt)
     flush_graveyard(rt->get_device(), false);
 
     handle_keys(rt);
-    auto_redetect_check(rt);
 
     apply_shader_link(rt);
 

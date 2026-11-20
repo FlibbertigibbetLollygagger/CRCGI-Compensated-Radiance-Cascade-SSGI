@@ -1,6 +1,6 @@
 # What the add-on talks to (for other shaders)
 
-Everything below is already in `shader/CRCGI_v1_4C.fx`. This page lists the textures and settings the CRCGI Injector binds or writes,
+Everything below is already in `shader/CRCGI_v1.2.fx`. This page lists the textures and settings the CRCGI Injector binds or writes,
 for anyone who wants to read the same data from another effect.
 
 ## Textures (bound by the add-on, readable by any effect)
@@ -11,13 +11,14 @@ for anyone who wants to read the same data from another effect.
 | `CRCGI_ALBEDO` | base colour (sRGB view if the game wrote it through one, so samples are linear) | level C, albedo feed delivered |
 | `CRCGI_MOTION` | motion vectors (units per `Integration_MotionUnits`) | level C, motion feed delivered |
 | `CRCGI_HDRSCENE` | the game's lighting buffer before tonemapping (linear, game units; the shader matches its exposure) | level C, HDR feed delivered |
-| `DEPTH` | the depth buffer in use at the injection layer | level B / C with an in-frame injection |
+| `CRCGI_SCENE` | the finished frame: the image where the game's 3D rendering is done (before ui / fog), same size and format family as the back buffer | level C, finished-frame feed delivered (this frame) |
+| `DEPTH` | the depth buffer in use at the forced layer | level B / C with Force render (advanced) |
 
 ## Settings (category "Game Integration" and the camera)
 
 | Name | Visible | Written by the add-on |
 |---|---|---|
-| `UseNormalTexture`, `Integration_Albedo`, `Integration_Motion`, `Integration_HDRScene` | yes | only with "Drive the shader's switch" ticked for that feed (off by default): on exactly while the feed is delivered |
+| `UseNormalTexture`, `Integration_Albedo`, `Integration_Motion`, `Integration_HDRScene`, `Integration_Scene` | yes | only with "Drive the shader's switch" ticked for that feed (off by default): on exactly while the feed is delivered |
 | `Integration_NormalSpace` (0 view, 1 world / any, auto-aligned) | yes | with the normals switch |
 | `Integration_GeometrySource` (0 rebuild, 1 game where valid, 2 game only) | yes | with the normals switch (add-on G-Buffer tab) |
 | `Integration_NormalFitSmoothing` | yes | no |
@@ -29,9 +30,9 @@ for anyone who wants to read the same data from another effect.
 
 ## Passes
 
-`TM` (tonemapper state, and the HDR scene light's exposure match), `Sky`, `SkyMap`, `Luma`, `Flow3..0` (no work with game motion),
+`TM` (tonemapper state, and the HDR scene light's exposure match), `Sky`, `SkyMap`, `Luma`, `Flow3..0` (no work with game motion, or when nothing uses the motion),
 `NormalFit` / `NormalRot` (world-space normal alignment), `Prep` (geometry + pickup), `MBMap`, `Pyr1..3`, `Canvas` (with confidence),
-`LumStats`, `Cascade5..0`, `ProbeAvg0`, `Gather`, `DenoiseH/V`, `CopyPrev`, `CopyCanvas`, `CopySkyMap`, `CopyNormalRot`, `CopyHC1..5`
+`LumStats`, `Cascade5..0`, `ProbeAvg0`, `Gather`, `DenoiseH/V` (V also writes the history age), `CopyPrev`, `CopyCanvas`, `CopySkyMap`, `CopyNormalRot`, `CopyHC1..5`
 (history of the accumulated cascades), `Contact` (full resolution), `Composite`.
 
 ## Debug: G-Buffer & Canvas (`GBufferDebugView`)
@@ -43,3 +44,10 @@ for anyone who wants to read the same data from another effect.
 
 0 off, 1 GI only, 2 bounce only, 3 escape visibility, 4 enclosure, 5 normals, 6 hit radiance buffer, 7 cascade 3 radiance, 8 linear depth,
 9 object thickness, 10 GI before denoise, 11 contact occlusion, 12 motion flow, 13 emitters.
+
+## The finished frame
+
+`CRCGI_SCENE` is a copy of a render target the game finished drawing the 3D scene into. With `Integration_Scene` on, the CRCGI shader
+reads it instead of the back buffer for everything it analyses, and adds its light to the final back buffer through
+`final + keep * (result - scene)`, where `keep` falls to 0 for pixels where the back buffer no longer matches the copy (ui, opaque
+overlays) and stays high for soft changes (fog). Another effect can use the same semantic to stay away from the ui in the same way.

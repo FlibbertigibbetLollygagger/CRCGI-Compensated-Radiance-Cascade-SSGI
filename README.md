@@ -1,8 +1,8 @@
-# CRCGI (Compensated Radiance Cascade Global Illumination)
+# CRCGI v1.2 (Compensated Radiance Cascade Global Illumination)
 
-CRCGI is a global illumination effect for ReShade (it's built on radiance cascades), and it comes with an add-on, the CRCGI Injector, that hands the effect what the game already knows (normals, albedo, motion vectors, depth, camera fov) and can render it inside the game's frame (behind the ui, before post-processing, before transparent effects) instead of on the finished image. This README explains how both parts work, how to install them, and how to tune the settings, every setting is listed near the bottom with its default, range and what it does (the tooltips in ReShade say the same thing, just shorter).
+CRCGI is a global illumination effect for ReShade (it's built on radiance cascades), and it comes with an add-on, the CRCGI Injector, that hands the effect what the game already knows (normals, albedo, motion vectors, depth, camera fov) and lets the effect ignore the ui and fog (it works on a copy of the game's finished 3D picture and adds its light to the final image). This README explains how both parts work, how to install them, and how to tune the settings, every setting is listed near the bottom with its default, range and what it does (the tooltips in ReShade say the same thing, just shorter).
 
-The shader works on its own like any other ReShade effect. The add-on is optional, it just removes guesswork (without it the shader rebuilds normals from depth, estimates motion by block matching, and estimates reflectance from the image) and lets the effect sit at a better place in the frame.
+The shader works on its own like any other ReShade effect. The add-on is optional, it just removes guesswork (without it the shader rebuilds normals from depth, estimates motion by block matching, and estimates reflectance from the image) and lets the effect leave the ui and fog alone instead of processing the whole final image.
 
 
 **Why this approach matters.** Instead of relying on independent, randomly scattered rays, CRCGI uses structured radiance cascades to reuse directional lighting information across distances. It combines depth-aware hit detection, visibility-preserving cascade merging, temporal stabilization, and a remembered off-screen canvas to make diffuse GI practical in a screen-space ReShade effect. The optional add-on can provide real game buffers and place the effect earlier in the rendering pipeline, avoiding some of the limitations of sampling only the final image. The goal is playable, subtle lighting that complements the game's art direction, not a screenshot-only effect.
@@ -16,10 +16,10 @@ The shader works on its own like any other ReShade effect. The add-on is optiona
 ## Install
 
 1. Copy `crcgi_injector.addon64` (64-bit game) or `crcgi_injector.addon32` (32-bit game) next to the game's exe, where ReShade's dll is.
-2. Copy `CRCGI_v1_4C.fx` into `reshade-shaders\Shaders`.
-3. Start the game, enable **CRCGI v1** in ReShade, then open **Add-ons > CRCGI Injector**.
+2. Copy `CRCGI_v1.2.fx` into `reshade-shaders\Shaders`.
+3. Start the game, enable **CRCGI v1.2** in ReShade, then open **Add-ons > CRCGI Injector**.
 
-For example in The Witcher 3 the DX12 exe is `bin\x64_dx12\witcher3.exe` and the DX11 one is `bin\x64\witcher3.exe`, the game is 64-bit so you want the `.addon64`, and on DX12 the in-frame injection is experimental (more on that below).
+For example in The Witcher 3 the DX12 exe is `bin\x64_dx12\witcher3.exe` and the DX11 one is `bin\x64\witcher3.exe`, the game is 64-bit so you want the `.addon64`, and on DX12 forcing the effect into the frame (an advanced option) is experimental (more on that below).
 
 Out of the box the add-on is on **level A** (the effect runs at the end of the frame like any ReShade effect) and it doesn't touch any of the shader's switches, so a first start can't go wrong because of a wrong detection. You turn the extra stuff on yourself when you want it (first run, below). The shader starts with **GI Intensity at 0**, so you'll see the game's own picture until you raise it (the tuning guide starts there).
 
@@ -32,13 +32,13 @@ It's one technique with a lot of passes. Most of them run at the **effect resolu
 | Stage | Passes | What it does |
 |---|---|---|
 | State | TM, Sky, SkyMap | tonemapper exposure state, the average sky tint from 6 points near the top of the screen, and a small map of the sky's color across the screen |
-| Luminance and motion | Luma, Flow3 to Flow0 | a luminance pyramid, then a block-matching motion estimate (coarse to fine). With *Use Game Motion Vectors* on, these four passes do no work |
+| Luminance and motion | Luma, Flow3 to Flow0 | a luminance pyramid, then a block-matching motion estimate (coarse to fine, candidates are also scored by the depth of the surface they land on). With *Use Game Motion Vectors* on, or when nothing uses the motion (Temporal Accumulation, Multibounce, Relit Pickup and the off-screen canvas all off), these passes do no work |
 | World-space normals | NormalFit, NormalRot | only used when the game's normals are in world space, they fit the rotation that lines the game's normals up with normals rebuilt from depth (about 9000 samples every frame) and apply it |
 | Prep | Prep | builds the per-texel geometry (depth, normal, thickness) and the hit radiance, which is the light a ray gets when it hits that surface (the image, relit pickup, HDR pickup, the game's HDR scene light) |
 | Secondary | MBMap, Pyr1 to Pyr3, Canvas, LumStats | the multibounce map (last frame's GI reprojected, at `CRCGI_SECONDARY_DIVISOR`), the min/max depth pyramid for the far rays, the off-screen canvas, and the screen brightness for Dark Area Boost |
 | **Cascades** | far cascade down to cascade 1 | trace and merge, farthest first, each one merged into the next nearer one |
 | Gather | ProbeAvg0, Gather | average each probe of the nearest cascade, then an edge-aware read of those probes into per-texel GI plus sky ambient |
-| Filter | DenoiseH, DenoiseV | separable, variance-guided, edge-aware denoise (the vertical pass also blends with the temporal history) |
+| Filter | DenoiseH, DenoiseV | separable, variance-guided, edge-aware denoise (the vertical pass also blends with the temporal history and keeps each pixel's history age) |
 | History | CopyPrev, CopyCanvas, CopySkyMap, CopyNormalRot, CopyHC1 to CopyHC5 | store this frame for the next one (history copies for cascades that don't accumulate are skipped) |
 | Output | Contact, Composite | contact shadowing (full resolution, nearly free when Crevice Light Bounce Bias is 0), then the edge-aware upsample to full resolution, albedo response, rolloff, add to the image, dither |
 
@@ -100,7 +100,7 @@ What a ray gets at a hit is built in the Prep pass, the image over a 5-tap blur,
 
 ### Temporal, denoise, upsample
 
-The GI is gathered from the probes of the nearest cascade (a 4x4 tent when Gather Smoothing is above 0), denoised at effect resolution (separable, edge-aware, variance-guided like SVGF, with firefly clamping), blended with the history reprojected by the motion (game vectors or the estimate) and thrown away where depth or light disagree, then upsampled to full resolution edge-aware (every pixel only takes light from low-res texels on its own surface).
+The GI is gathered from the probes of the nearest cascade (a 4x4 tent when Gather Smoothing is above 0), denoised at effect resolution (separable, edge-aware, variance-guided like SVGF, with firefly clamping), blended with the history reprojected by the motion (game vectors or the estimate) and thrown away where depth or light disagree, then upsampled to full resolution edge-aware (every pixel only takes light from low-res texels on its own surface). The history is read from the four texels around the reprojected position, each weighted by how well its depth and normal agree with the pixel, so light doesn't cross over from another surface, and every pixel carries its **history age**: a pixel without history takes 1/2, 1/3, 1/4 of each new frame (instead of 1 - 1/Frames at once), so a newly revealed surface settles in a few frames and doesn't keep its first noisy frame. Once the age is full the blend is the usual one, so a steady picture looks the same.
 
 ### Canvas, sky, contact shadowing
 
@@ -132,59 +132,66 @@ Changing any of these reloads the effect.
 
 It does three things, and each one can be switched on or off while the game is running:
 
-1. **Feeds.** It copies the game's own render targets (G-buffer normals, albedo, motion vectors, HDR scene light) and the depth buffer in use, and binds them to the shader as textures. It also reads the camera's vertical fov from the game's projection matrix and writes it to the shader.
-2. **In-frame injection.** It renders the effect right before a layer you pick (below the ui, before post-processing, before transparent effects) instead of on the finished image.
+1. **Feeds.** It copies the game's own render targets (G-buffer normals, albedo, motion vectors, HDR scene light, and the **finished frame**) and hands them to the shader as textures. It also reads the camera's vertical fov from the game's projection matrix and writes it to the shader.
+2. **The finished frame (ignoring ui and fog).** You point the add-on at the last layer that holds the finished 3D picture (right before the ui, or before fog, whichever you want left alone). It copies that picture and the shader works on the copy, then adds its light to the final image, so everything the game draws after that point stays exactly as the game drew it. The effect still runs at the end of the frame like any ReShade effect, nothing is injected into the game (that is the point, it's the safe way).
 3. **Driving the shader.** It can set the shader's own switches (`Use Game Normals`, `Use Game Albedo` and so on) to match what it's delivering (the checkbox *Drive the shader's switch* in the G-Buffer tab, **off by default**, so the shader's checkboxes are yours), and it handles Geometry Source.
+
+There's also an advanced fourth thing, **Force render** (Options), that renders the effect inside the game's frame right before a layer you pick (more on it below). It's off by default and you only want it when the default can't do what you need.
 
 Levels (Numpad 7 / 9 or the Setup tab, Numpad 0 turns the whole add-on off). The add-on starts on **level A**:
 
 | Level | What changes |
 |---|---|
 | A | nothing, the effect runs at the end of the frame like any ReShade effect |
-| B | the effect is rendered right before the layer you picked, with the depth buffer in use there and the camera's fov |
-| C | B plus the G-buffer feeds (if there's no injection layer, or the API can't inject, the feeds are still bound at the end of the frame) |
+| B | A plus the camera's fov (and, if Force render is on, the effect rendered right before the layer you picked, with the depth buffer in use there) |
+| C | B plus the feeds (normals, albedo, motion vectors, HDR scene light, finished frame). They're captured while the game draws and bound before ReShade's end-of-frame render |
 
-Auto-setup raises the level to C by itself.
+Assigning a feed (Use as in the Profiler, or a role in the Layers tab) raises the level to C by itself.
 
 ### What works on which API
 
 | | D3D10 / 11 | D3D12 | Vulkan (incl. D3D9-11 through DXVK) | OpenGL |
 |---|---|---|---|---|
-| Feeds handed to the shader (level C) | yes | yes | yes (captured at the game's barriers) | yes |
-| Profiler, layer list with kinds, auto-setup | yes | yes | yes (no live layer preview) | yes |
-| Effect rendered **inside** the frame (B / C) | yes (immediate context only) | **experimental**, it has its own state tracker and can be switched off | no, end of frame | no, end of frame |
+| Feeds handed to the shader (level C) | yes | yes (captured at the end of a binding, or right after a render pass ended) | yes (captured at the game's barriers) | yes |
+| Finished frame | yes | yes | yes | yes |
+| Profiler, layer list with kinds | yes | yes | yes (no live layer preview) | yes |
+| Compute-written targets (UAV) | yes (the bound views are seen) | no (descriptor heaps hide them, the texture is listed but can't be captured safely) | no | no |
+| Force render (inside the frame) | yes (immediate context only) | **experimental**, it has its own state tracker and can be switched off | no | no |
 
-Native DirectX 9 isn't supported (CRCGI needs Direct3D 10 or newer), DX9 games run through DXVK, which ReShade sees as Vulkan. Without in-frame injection the effect still gets the feeds, they're captured inside the frame and bound before ReShade's own end-of-frame render.
+Native DirectX 9 isn't supported (CRCGI needs Direct3D 10 or newer), DX9 games run through DXVK, which ReShade sees as Vulkan.
 
-### First run (based on v1 release, will be updated if drastic changes are made)
+### First run
 
-1. Enable **CRCGI v1** in ReShade, open **Add-ons > CRCGI Injector**.
-2. With the **3D scene on screen** (not a menu), press **Auto-setup** (Setup tab, or Numpad 1). It raises the level to C, picks the injection layer by the rule you set, snapshots the game's render targets, analyzes them and assigns normals, albedo, motion vectors and HDR scene light, **replacing** whatever was chosen before. The checklist in the Setup tab shows what worked and, when something didn't, why.
-3. Check it in the shader, under *Debug: G-Buffer & Canvas* (the *G-Buffer / Canvas View* combo):
+1. Enable **CRCGI v1.2** in ReShade, open **Add-ons > CRCGI Injector**. The effect already works at this point (level A, end of the frame, ui included).
+2. Optional, to use what the game knows. With the **3D scene on screen** (not a menu), open the **Profiler** and press **Take snapshot**. The add-on copies the game's candidate textures, analyzes them and **suggests** one per feed (normals, albedo, motion vectors, HDR scene light, finished frame) with a score bar, nothing is assigned for you (there's no auto-setup, every choice is yours). Press **Use as** under the texture you want for each feed, and check the thumbnail first (the thumbnail is exactly what the shader will receive).
+3. To leave the ui and fog alone: in the **Layers** tab pick the last layer that shows the finished 3D picture without the ui (click a row to preview it, **double-click** it or press its role combo and choose **Finished frame**). Then turn on *Use Game Finished Frame If Provided* in the shader (Game Integration).
+4. Check the other feeds in the shader, under *Debug: G-Buffer & Canvas* (the *G-Buffer / Canvas View* combo):
    - **Normal Difference: Game vs Depth**, mostly black is good (the game normals agree with the ones rebuilt from depth), white is 90 degrees apart.
    - **Game Albedo (input)**, **Game Motion Vectors (input)** and **Game HDR Scene Light (input)** should each look like what their name says.
-   - **Game Normal Auto-Align Status** if the game's normals are in world space (the auto-detect sets *Game Normal Space* to world by itself).
-4. Once a feed looks right, turn its switch on in the shader (*Use Game Normals If Provided* and so on, in Game Integration), or tick **Drive the shader's switch** for that feed in the add-on's G-Buffer tab and let the add-on do it (it then keeps the switch on exactly while the feed is delivered).
-5. For games with DLSS, FSR or XeSS leave **Upscaler** on Auto (see below).
-6. If a feed looks wrong, go to the **G-Buffer** tab and check the decode options (normal encoding and space, motion units), or pick a different texture in the **Profiler** or **Layers** tab.
+   - **Game Normal Auto-Align Status** if the game's normals are in world space (assigning normals from the Profiler sets *Game Normal Space* to world by itself when the analysis says so).
+5. Once a feed looks right, turn its switch on in the shader (*Use Game Normals If Provided* and so on, in Game Integration), or tick **Drive the shader's switch** for that feed in the add-on's G-Buffer tab and let the add-on do it (it then keeps the switch on exactly while the feed is delivered).
+6. For games with DLSS, FSR or XeSS leave **Upscaler** on Auto (see below).
+7. If a feed looks wrong, go to the **G-Buffer** tab and check the decode options (normal encoding and space, motion units), or pick a different texture in the **Profiler** or **Layers** tab.
 
-After a loading screen the feeds get re-detected automatically if their textures were recreated (*Re-detect after loading screens*, on by default).
+After a loading screen the game recreates its textures and the add-on finds them again by their description and creation order (a feed whose texture isn't found yet shows as *not created by the game right now* until it is).
 
 ### The tabs
 
+The overlay is laid out vertically (cards and stacked bars instead of wide tables), so it stays readable at about a third of a 1440p screen's width.
+
 | Tab | What it's for |
 |---|---|
-| **Setup** | quick start, the injection rule (before the ui, before post-processing, or before transparent effects), the upscaler, the last auto-setup report, and a checklist (technique, injection layer, depth, camera, each feed) that tells you the reason when something is missing. Also the techniques and the shader link |
-| **G-Buffer** | one collapsible section per feed (normals, albedo, motion, HDR scene light) with a status badge, where it comes from, a thumbnail of exactly what the shader receives, why it's not used if it isn't, and its decode options. Also *Geometry Source* and a "shader work saved" list that shows what the shader is skipping right now |
-| **Layers** | the recorded layer catalog as a table (# / Target / Kind / Draws / Notes / Role), you can sort, filter, preview and assign roles |
-| **Profiler** | the game's render-target textures, found from their creation calls (so it works on D3D12 and Vulkan, where descriptor heaps hide the bindings), with thumbnails, usage and analysis scores for every feed type, and "use as" buttons |
+| **Setup** | quick start, the upscaler, and a checklist (technique, camera, depth, each feed) that tells you the reason when something is missing. Also the camera picker and the shader link |
+| **G-Buffer** | one collapsible section per feed (normals, albedo, motion, HDR scene light, finished frame) with a status badge, where it comes from, a thumbnail of exactly what the shader receives, why it's not used if it isn't, and its decode options. Also *Geometry Source* and a "shader work saved" list that shows what the shader is skipping right now |
+| **Layers** | the recorded layer catalog as a list of cards (id, target, kind, draws, note, role), you can sort, filter, preview and assign roles. By default only layers the game draws **every frame** are listed |
+| **Profiler** | the game's render-target textures, found from their creation calls (so it works on D3D12 and Vulkan, where descriptor heaps hide the bindings), with a thumbnail, usage, a score bar for each feed type it could be (the best candidate per feed is marked), and "use as" buttons |
 | **Keys** | every action is remappable (with Ctrl, Shift, Alt), hold delay and repeat rate are adjustable, and there's a Reset all |
-| **Debug** | what the shader receives, capture and injection counters, the last check of the D3D12 tracker, and a verbose log switch |
-| **Options** | the end-of-frame fallback, live depth, feeds from other command lists, D3D12 in-frame injection, a note about performance and async compute, and the Build line (add-on and ReShade revision) |
+| **Debug** | what the shader receives, capture counters, the last check of the D3D12 tracker, and a verbose log switch |
+| **Options** | sharing the target listing (below), feeds from other command lists, **Force render (advanced)**, a note about performance and async compute, and the Build line (add-on and ReShade revision) |
 
 ### Layers, kinds and roles
 
-A layer is a render target that gets written during the frame, listed in the order it's drawn. The catalog is **recorded over about 3 seconds and then kept**, so the list stays stable. Each row has a **kind**, detected from how it's drawn (blend and depth-write state are recorded per pipeline):
+A layer is a render target that gets written during the frame, listed in the order it's drawn. The catalog is **recorded over about 3 seconds and then kept**, so the list stays stable, and a layer that hasn't been drawn for 10 seconds (and has no role) is dropped. Each row has a **kind**, detected from how it's drawn (blend and depth-write state are recorded per pipeline):
 
 | Kind | Detected when (from the code) |
 |---|---|
@@ -195,9 +202,11 @@ A layer is a render target that gets written during the frame, listed in the ord
 | Transparent | depth bound and mostly blended draws |
 | Opaque (geometry) | depth bound, otherwise |
 
-These are heuristics, not facts, so **check the preview**. Click a row to preview it, **double-click to render CRCGI there**. The role combo has its own column (*Render CRCGI here*, *Depth*, *Normals*, *Albedo*, *Motion vectors*, *HDR scene light*). Sorting can be by frame order, resolution then frame order, kind then frame order, most draws, format then frame order, or assigned roles first (ties always keep frame order), and there's a text filter.
+**Only layers that are always rendered.** The list hides a layer unless it was drawn in at least 95% of the frames since it was first seen (and for at least a second of frames, and it's still drawn now). Menus, cut-scenes, weather and effects the camera only sometimes sees would otherwise fill the list with rows that are grayed out most of the time. Layers with a role are always shown, and the checkbox *Only layers drawn every frame* (Layers tab) turns the filter off. Draws that draw nothing (no vertices or no instances) don't open a layer, and a clear of a bound target ends the layer it was part of.
 
-**Choosing the injection layer.** The target has to have the back buffer's size and format family and be single-sampled (ReShade copies it). *Auto-setup* picks the first layer of the chosen kind that can take the effect, **before the ui** by default, or before post-processing, or before transparent effects. If nothing of that kind is usable it falls back to the ui layer, and then to the last screen-format single-target layer before the first one that's drawn into the back buffer. If nothing qualifies the effect just runs at the end of the frame and the report says so. HDR (FP16) scene targets on an 8-bit back buffer can't be injected into.
+These are heuristics, not facts, so **check the preview**. Click a row to preview it, **double-click to use it as the finished frame**. The role combo is on every card (*Force render here*, *Depth*, *Normals*, *Albedo*, *Motion vectors*, *HDR scene light*, *Finished frame*). Sorting can be by frame order, resolution then frame order, kind then frame order, most draws, format then frame order, or assigned roles first (ties always keep frame order), and there's a text filter.
+
+**Choosing the finished frame.** It has to be a single-sampled target of the back buffer's size and format family (it's the picture the shader reads instead of the final image, so a different format would be decoded wrongly). Pick the last layer **before** whatever you want left alone: before the ui to leave the hud untouched, before fog or particles if you want those untouched too (the GI then also ignores what they add to the picture). Where the final image still shows the finished frame the effect's light is added to it, where it doesn't (hud pixels, opaque overlays) the pixel stays as the game drew it, and soft changes made after the copy (fog) keep most of the effect. It's a copy plus a few extra texture reads, not an injection.
 
 ### The feeds
 
@@ -207,28 +216,54 @@ These are heuristics, not facts, so **check the preview**. Click a row to previe
 | Albedo | `CRCGI_ALBEDO` | multibounce reflectance, relit pickup, Surface Albedo Response | the 16-tap reflectance estimate per texel and the albedo-response taps |
 | Motion vectors | `CRCGI_MOTION` | history reprojection, canvas, multibounce | the 4 block-matching passes |
 | HDR scene light | `CRCGI_HDRSCENE` | light pickup from the lighting buffer (no ui, bloom or grain, full range), exposure matched to the image every frame | none |
+| Finished frame | `CRCGI_SCENE` | the picture the effect works on (light pickup, luminance, composite base) while the final image is only used to keep what was drawn later | none |
 
 Other effects can read the same textures by declaring `texture2D t : CRCGI_ALBEDO;` and so on.
 
-**Decode options (G-Buffer tab).** Normals have an encoding (RGB stored 0 to 1 and decoded as *2-1, octahedral 2-channel, or RGB signed as stored) and a space (view, or world / anything else, which gets auto-aligned). Motion has units (UV, pixels, NDC), flip Y and invert direction.
+**Decode options (G-Buffer tab).** Normals have an encoding (RGB stored 0 to 1 and decoded as *2-1, octahedral 2-channel, or RGB signed as stored) and a space (view, or world / anything else, which gets auto-aligned). Motion has units (UV, pixels, NDC), flip Y and invert direction. A motion target with four channels (velocity in two of them, depth or a mask in the others) is recognized by the profiler too, and the shader reads the first two.
 
-**What gets checked.**
+### How the data is captured (and why it doesn't flash)
 
-- Copies are only taken where the texture's state is known, at the end of a binding interval in which it was a render target, or right after the game's own barrier out of that state. A barrier is never placed on a guessed state.
-- At the injection point a feed is only used if it was captured in the same frame and before the layer. At the end of the frame the latest capture is used if it's at most 3 frames old.
-- Textures are identified across loads and restarts by their description and creation slot. A recreated texture takes over its assignment, and if one disappears for good the auto re-detect replaces it (at most every 10 s).
+- **Hooks.** The add-on listens to the same things a shader toggler does: every draw, indexed draw, indirect draw and compute dispatch, pipeline binds (the shader hashes), render target binds, render passes, clears and barriers. GPU-driven games (indirect draws) and compute passes therefore count.
+- **A texture is captured at its main binding only.** Engines reuse the same memory later in the frame for unrelated passes, and a copy taken there would overwrite the G-buffer copy (that's what made a feed flash on and off). Each texture remembers the binding that drew most to it, a feed taken from the texture is copied only there, and only one binding per frame can update it. The main binding only changes if the old one is gone for half a second or the new one draws more than twice as much.
+- **Copies are only taken where the texture's state is known**, at the end of a binding interval in which it was a render target, or, on D3D12 inside a render pass, right after the pass ended (at the next event of the command list, since nothing may be copied inside one). On Vulkan, where nothing can be copied inside a render pass at all, it's right after the game's own barrier out of that state, once the texture's main binding has ended. **Direct3D 12 never copies at a barrier** (the event can't tell the first half of a split barrier from a full transition, and a copy between the halves is invalid). A barrier is never placed on a guessed state.
+- **Compute (D3D10/11).** The unordered access views the game binds before a dispatch are seen, so a target written by compute (motion vectors, lighting, a ui composite) can be a feed too: it's copied right after the first dispatch that writes it in the frame. On D3D12 and Vulkan the views live in descriptor heaps and aren't visible, the texture is still listed in the profiler but can't be captured safely.
+- **Layer identity.** A layer's key is the shaders it uses plus its targets (format, size, creation order) plus the occurrence of that signature within the frame's recording of one command list, so it doesn't depend on how command lists are interleaved on other threads. The occurrence counter restarts every frame on every API, so a command list that's reused or recorded in a different order doesn't make a layer's identity drift.
+- **Threads.** The frame number is atomic, so command lists recorded on worker threads always compare against the current frame.
+- At the end of the frame a G-buffer feed is used if its latest capture is at most 3 frames old, the **finished frame** only if it was captured in this very frame (an old copy would show a stale picture and the effect falls back to the final image). At a forced-render point every feed must be from this frame.
+- Textures are identified across loads and restarts by their description and creation slot. A recreated texture takes over its assignment.
 - Albedo written through an sRGB view is sampled through an sRGB view, normals and motion are always linear.
-- Multisampled targets: albedo and HDR scene light are resolved, normals and motion are reported as unsupported.
+- Multisampled targets: albedo, HDR scene light and the finished frame are resolved, normals and motion are reported as unsupported.
 - *Accept feeds recorded on another command list* (Options, on by default), since D3D12 games record the G-buffer and the lighting on different command lists.
 
-### How injection works (and why the effect isn't rendered twice)
+### What the profiler suggests (and how it scores)
 
-At the chosen layer the add-on calls ReShade's `render_technique` for each ticked technique that's also enabled in ReShade. During ReShade's own end-of-frame render the managed techniques are switched off and switched back on right after, and only in frames where the injection actually ran, your switches and your preset are never changed.
+The profiler reads 16 small tiles of each snapshot and measures them, then scores every feed type from 0 to 1 (0.6 and above is a suggestion, and nothing is ever assigned for you).
+
+| Feed | What the score looks for |
+|---|---|
+| Normals | unit-length vectors in most pixels (three channels, with variety), or two channels spread over the square (octahedral) |
+| Albedo | three or more channels in 0..1, not unit vectors, not HDR, plausible brightness. sRGB storage helps, but plain 8-bit (4 bytes per pixel) or R11G11B10 colour clears the bar too, a write together with a depth buffer in a many-target pass adds a bit |
+| Motion vectors | two channels that are mostly tiny (UV sized), or four channels where the first two are tiny and it's float or signed (velocity next to depth or a mask) |
+| HDR scene light | a floating-point colour target. Values above 1 raise the score but aren't required (dark rooms and overcast scenes stay inside 0..1), a target written alone with many draws and at screen size scores higher |
+| Finished frame | a screen-sized colour target in the back buffer's format family, no depth, written alone |
+
+### Share the target listing (Options)
+
+What the add-on knows about one game (which texture is the normals, which layer is the finished frame, the upscaler setting, your notes) can be exported and shared next to a preset, if the preset's author wants to.
+
+- **Export the target listing** writes `crcgi_targets_<game>.ini` next to the game's exe. It has the feeds (as textures: format, usage, creation order, and the **size relative to the screen**, so it's found again at another resolution), the level, the geometry source and upscaler settings, the camera choice and the author and notes you typed. It does **not** have your keys, your overlay options, your technique choice or a force-render layer (those are yours).
+- **Import** (same place) lists every `crcgi_targets*.ini` next to the exe. Copy a listing there, press Import, and the add-on matches the textures as the game creates them (it also looks again every second or so until the missing ones appear). Layer-based assignments (a layer's role) depend on the screen resolution (a layer's key includes its size), textures don't, so for a listing you want to share assign the feeds from the Profiler (Use as) rather than from the Layers tab.
+- A listing is only text, open it, it's short. The same file format is what the add-on saves for itself in `crcgi_injector.ini` (that one also has the keys and the overlay options).
+
+### How Force render works (and why the effect isn't rendered twice)
+
+This is the old way of doing it and it's still there (Options > Force render (advanced), plus the layer role *Force render here*): at the chosen layer the add-on calls ReShade's `render_technique` for each ticked technique that's also enabled in ReShade. During ReShade's own end-of-frame render the managed techniques are switched off and switched back on right after, and only in frames where the forced render actually ran, your switches and your preset are never changed. It changes the game's command stream, so it's the one place where a game can misbehave, which is why it's not the default.
 
 - **D3D10/11.** ReShade restores the game's state itself, and only the immediate context is used.
-- **D3D12 (experimental).** The add-on records and restores everything the game had bound (pipeline state, root signatures for graphics and compute, every root parameter, descriptor heaps, topology, blend factor, stencil reference, viewports, scissors and render targets). A layer whose state is incomplete, or that's drawn inside a render pass, is refused and the reason is shown. If the game crashes when a layer is chosen, switch off **Options > Direct3D 12: in-frame injection** (or put `D3D12Inject=0` in `crcgi_injector.ini`), level C still works at the end of the frame after that.
+- **D3D12 (experimental).** The add-on records and restores everything the game had bound (pipeline state, root signatures for graphics and compute, every root parameter, descriptor heaps, topology, blend factor, stencil reference, viewports, scissors and render targets). A layer whose state is incomplete, or that's drawn inside a render pass, is refused and the reason is shown. If the game crashes when a layer is chosen, switch off **Options > Force render** (or **Direct3D 12: allow it**).
 - **Vulkan / OpenGL.** End of frame only, since restoring a Vulkan game's state (and DXVK's cached copy of it) after an effect can't be done safely from an add-on.
-- **ReShade Effect Shader Toggler.** While it's loaded the in-frame injection stands down (feeds and the profiler still work).
+- **ReShade Effect Shader Toggler.** While it's loaded Force render stands down (feeds and the profiler still work).
 
 ### Default keys (numeric keypad, they work with the overlay closed)
 
@@ -237,10 +272,8 @@ At the chosen layer the add-on calls ReShade's `render_technique` for each ticke
 | Numpad 0 | integration on / off |
 | Numpad 7 / 9 | level down / up |
 | Numpad 8 / 2 | previous / next layer (hold to repeat, the list follows) |
-| Numpad 5 | render CRCGI at the selected layer |
+| Numpad 5 | selected layer = finished frame |
 | Numpad 4 / 6 | previous / next role of the selected layer |
-| Numpad 1 | Auto-setup |
-| Numpad 3 | auto-detect feeds |
 | Numpad . | record layers |
 
 Keys pause while you're typing in the layer filter or while the Keys tab is waiting for a key.
@@ -248,21 +281,22 @@ Keys pause while you're typing in the layer filter or while the Keys tab is wait
 ### Camera, depth and upscalers
 
 - **Camera.** The add-on scans the game's constant buffer writes for a perspective projection matrix and gets the vertical fov, the near and far plane and the depth direction from it, and writes the fov to the shader's *Vertical Field of View* while it has the camera. It's a heuristic, so if no camera is found set the fov by hand (a wrong fov shows up as speckled or striped normals in *Debug View > Normals*).
-- **Depth.** *Hand the depth buffer in use at the layer to the shader* (Options, on by default) shows the shader the depth buffer that's bound at the injection point.
-- **Upscalers (DLSS / FSR / XeSS).** With the **Upscaler** option on Auto, the add-on finds the render resolution from the most-drawn smaller target. Render-resolution textures then count as screen-sized in the layer list, the profiler and the auto-detection, and can be used as feeds. Presets are Quality 66.7%, Balanced 58%, Performance 50%, Ultra Performance 33.3%, or a custom percentage.
+- **Depth.** With Force render on, *Hand the depth buffer in use at the layer to the shader* (Options) shows the shader the depth buffer that's bound at that point (all the usual depth formats, including D24S8 and D32S8, are mapped to a readable view). Without it, the shader uses the depth ReShade provides.
+- **Upscalers (DLSS / FSR / XeSS).** With the **Upscaler** option on Auto, the add-on finds the render resolution from the most-drawn smaller target. Render-resolution textures then count as screen-sized in the layer list and the profiler, and can be used as feeds. Presets are Quality 66.7%, Balanced 58%, Performance 50%, Ultra Performance 33.3%, or a custom percentage.
 
 ### Logging (and what to send when something goes wrong)
 
-Everything goes to `ReShade.log` on lines that start with `[CRCGI Injector]` (the load line with 64/32-bit and ReShade revision, the device API, the first injection, every refused injection or feed with its reason, auto-setup and auto-detect results, auto re-detects). If you report a problem, send `ReShade.log` and `crcgi_injector.ini`, a screenshot of the Setup checklist and the G-Buffer tab, what you did right before, whether it's DX11 or DX12 and which other add-ons are installed, and for a crash the `exception_*.dmp` that ReShade wrote next to the exe.
+Everything goes to `ReShade.log` on lines that start with `[CRCGI Injector]` (the load line with 64/32-bit and ReShade revision, the device API, every refused forced render or feed with its reason). If you report a problem, send `ReShade.log` and `crcgi_injector.ini`, a screenshot of the Setup checklist and the G-Buffer tab, what you did right before, whether it's DX11 or DX12 and which other add-ons are installed, and for a crash the `exception_*.dmp` that ReShade wrote next to the exe.
 
 ### Limits
 
-- The injection layer has to match the back buffer's size and format family, HDR scene targets on an SDR back buffer can't be injected into.
-- In-frame injection is D3D10/11 only (D3D12 is experimental), Vulkan and OpenGL run at the end of the frame.
+- The finished frame (and a forced-render layer) has to match the back buffer's size and format family, HDR scene targets on an SDR back buffer can't be used for it.
+- Force render is D3D10/11 only (D3D12 is experimental), Vulkan and OpenGL run at the end of the frame.
 - **Async compute isn't possible from a ReShade add-on.** ReShade renders every pass of an effect on one graphics command list and its API can't create a compute queue or move a pass to another one, so the build reduces work instead (see Performance).
-- A per-pixel transparency mask isn't something a game keeps in a texture, so transparent layers get detected (and auto-setup can render the GI before them), but there's no transparency input.
+- A per-pixel transparency mask isn't something a game keeps in a texture, so there's no transparency input (the finished frame is the way to leave fog and glass alone).
 - Normals and motion feeds on multisampled targets are unsupported.
-- Layer identity is a hash of the target description and its position, so it can change after a game update, just run Auto-setup again.
+- Targets written by compute are only visible on D3D10/11.
+- Layer identity is a hash of the target description and its position, so it can change after a game update (layers assigned by role then need picking again, textures are matched by description and survive more).
 
 ## Tuning guide
 
@@ -312,6 +346,7 @@ What to look at: *Debug View > Normals* (a flat wall must be one even color), *D
 | Use Game Albedo If Provided | off | off | Turn it on once *Game Albedo (input)* looks right. Multibounce, the relit pickup and Surface Albedo Response then use the real albedo and the 16-tap estimate is skipped (Relit Albedo Detail, Relit Detail Radius and Bounce Reflectance (estimate) stop doing anything where the albedo is valid). | If the albedo view looks wrong (dark or wrong colors), leave it off. |
 | Use Game Motion Vectors If Provided | off | off | Turn it on once *Game Motion Vectors (input)* looks right. The four block-matching passes stop doing work and the history follows the exact motion (Motion Mismatch Rejection stops doing anything). | Light trails behind moving objects usually mean wrong units, Flip Y or Invert direction (G-Buffer tab of the add-on). |
 | Use Game HDR Scene Light If Provided | off | off | Turn it on when the add-on delivers the game's lighting buffer, rays then pick up light without UI, bloom or grain and with the full brightness range. | If *Game HDR Scene Light (input)* is black the match failed, leave it off. |
+| Use Game Finished Frame If Provided | off | off | Turn it on once the add-on delivers the finished frame (the last layer before the ui or fog, picked in its Layers tab or Profiler). The effect then works on that picture and adds its light to the final image only where the final image still shows it, so ui and fog stay as the game drew them. | If the add-on's Finished frame thumbnail shows the hud or is black, leave it off and pick another layer. |
 
 Set a temporary, low **GI Intensity** while tuning this stage, and use **GI Only**, **Emitters**, **Linear Depth** and **Object Thickness** to distinguish missed hits from blocked rays. Start with the default hit model, check walls, floors, foliage and thin objects, then change only the controls that address visible misses, halos or light passing through geometry. Return to the final brightness stage after the geometry is reliable.
 
@@ -694,7 +729,7 @@ These combine the settings above for common situations, use them as starting poi
 - **Open outdoor.** Sky Light on with a small strength (0.01 to 0.05), Directional Sky Map on, keep Max GI Distance and Fade With Receiver Distance at the defaults, the far cascades matter here so keep Far Jitter at 1 and the far accumulation as it is, and keep the canvas on.
 - **HDR output.** Game Output Signal on Auto, set Paper White and Peak to the game's values, keep HDR Light Pickup at 0.6 and watch for fireflies on small bright spots (lower HDR Pickup Range if they show up). With the add-on's *Game HDR Scene Light* the pickup comes from the lighting buffer, with the full range.
 - **Racing and flight (long draw distance).** Relative Depth Tolerances 1, Tolerance Reference Depth at the depth where your slider values look right (the typical depth around the car), Sky Rejection Depth just above the horizon's depth, Depth Separation Limit raised (the road runs to the horizon), Far Cascade Separation Relax up, Max GI Distance high.
-- **With the full add-on (deferred game).** Geometry Source on *Game normals only* once the Normal Difference view is mostly black (fastest, no depth rebuild), Use Game Albedo on (skips the reflectance estimate), Use Game Motion Vectors on (skips four passes), Use Game HDR Scene Light on. Each of these is a shader switch (the add-on turns them for you if you tick *Drive the shader's switch* for that feed).
+- **With the full add-on (deferred game).** Geometry Source on *Game normals only* once the Normal Difference view is mostly black (fastest, no depth rebuild), Use Game Albedo on (skips the reflectance estimate), Use Game Motion Vectors on (skips four passes), Use Game HDR Scene Light on, and Use Game Finished Frame on when you want the ui and fog left alone. Each of these is a shader switch (the add-on turns them for you if you tick *Drive the shader's switch* for that feed).
 - **Low-end hardware.** `CRCGI_RESOLUTION_DIVISOR` 4, `CRCGI_CASCADES` 4, Rays Per Cell 1, Ray Steps: Far 8, Far Cascades: Half-Rate Update on, Gather Smoothing 0, Denoise Kernel Radius 3 to 5, `CRCGI_CANVAS_MARGIN` 0 if you don't need off-screen light, Crevice Light Bounce Bias 0 (contact work off). Expect softer and noisier light.
 - **High quality.** `CRCGI_RESOLUTION_DIVISOR` 2, `CRCGI_CASCADES` 5, Rays Per Cell 3, Ray Steps: Far 12, Cross-Fade 0.25, Gather Smoothing 1, `CRCGI_SECONDARY_DIVISOR` 0 for the exact multibounce read. This is a lot more expensive.
 
@@ -820,6 +855,7 @@ This is a functional reference, not a preset. Each entry explains the control's 
 | Use Game Albedo If Provided | Use the game's albedo (base colour) from the add-on instead of estimating it from the image. **Relationship:** Real albedo supersedes estimated albedo/detail and Bounce Reflectance (estimate) where valid. |
 | Use Game Motion Vectors If Provided | Use the game's motion vectors from the add-on instead of the shader's own block-matching estimate (those passes then do no work). **Relationship:** Bypasses the shader's motion estimation and its mismatch rejection where valid. |
 | Use Game HDR Scene Light If Provided | Use the game's lighting buffer (before tonemapping, bloom, fog and UI) from the add-on as the light rays pick up, instead of the finished image: no UI, no bloom, no film grain, and the full brightness range. **Relationship:** Changes the source sampled for light pickup; reduces dependence on tonemapped final-frame colour and emitter reconstruction. |
+| Use Game Finished Frame If Provided | Work on the game's finished 3D image from the add-on (a copy taken before the UI, fog or whatever you chose to leave alone) instead of the final image, and add the light to the final image only where it still shows that frame. **Relationship:** Changes the picture every pass reads (light pickup, luminance, composite base); needs the copy to be the screen's size and format.
 
 ### HDR & Color Range
 

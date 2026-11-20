@@ -27,6 +27,7 @@
 #include <fstream>
 #include <limits>
 #include <mutex>
+#include <ostream>
 #include <shared_mutex>
 #include <string>
 #include <system_error>
@@ -75,47 +76,52 @@ enum Role : int
     ROLE_MOTION,
     ROLE_MATERIAL,
     ROLE_HDR,
+    ROLE_SCENE,        // the finished frame (see FEED_SCENE)
     ROLE_COUNT
 };
 
-static const char *const ROLE_LABEL[ROLE_COUNT] = { "-", "Render CRCGI here", "Depth", "Normals", "Albedo", "Motion vectors", "Material", "HDR scene light" };
-static const char ROLE_ITEMS[] = "-\0Render CRCGI here\0Depth\0Normals\0Albedo\0Motion vectors\0Material\0HDR scene light\0";
+static const char *const ROLE_LABEL[ROLE_COUNT] = { "-", "Force render here (advanced)", "Depth", "Normals", "Albedo", "Motion vectors", "Material", "HDR scene light",
+                                                    "Finished frame" };
+static const char ROLE_ITEMS[] = "-\0Force render here (advanced)\0Depth\0Normals\0Albedo\0Motion vectors\0Material\0HDR scene light\0Finished frame\0";
 
 // The feeds the shader can receive. NORMAL is the semantic the shader already declares; the others come with the CRCGI shader.
-enum Feed : int { FEED_NORMALS = 0, FEED_ALBEDO, FEED_MOTION, FEED_MATERIAL, FEED_HDR, FEED_COUNT };
+// FEED_SCENE is the finished frame: a copy of the image at the point where the game's 3D rendering is done (before UI, before fog or
+// whatever is drawn after it). The effect works on that copy and adds its light to the final image, so everything drawn after the copy
+// stays untouched.
+enum Feed : int { FEED_NORMALS = 0, FEED_ALBEDO, FEED_MOTION, FEED_MATERIAL, FEED_HDR, FEED_SCENE, FEED_COUNT };
 // The material feed (metalness / specular) is implemented but not offered in the overlay: the shader's matching
 // switch is hidden too. Set to true to expose it again.
 static constexpr bool UI_MATERIAL = false;
-static const char *const FEED_SEMANTIC[FEED_COUNT] = { "NORMAL", "CRCGI_ALBEDO", "CRCGI_MOTION", "CRCGI_MATERIAL", "CRCGI_HDRSCENE" };
-static const char *const FEED_LABEL[FEED_COUNT] = { "Normals", "Albedo", "Motion vectors", "Material (reflectivity)", "HDR scene light" };
+static const char *const FEED_SEMANTIC[FEED_COUNT] = { "NORMAL", "CRCGI_ALBEDO", "CRCGI_MOTION", "CRCGI_MATERIAL", "CRCGI_HDRSCENE", "CRCGI_SCENE" };
+static const char *const FEED_LABEL[FEED_COUNT] = { "Normals", "Albedo", "Motion vectors", "Material (reflectivity)", "HDR scene light", "Finished frame" };
 // The shader's switch for each feed (category Game Integration).
-static const char *const FEED_SWITCH[FEED_COUNT] = { "UseNormalTexture", "Integration_Albedo", "Integration_Motion", "Integration_Material", "Integration_HDRScene" };
+static const char *const FEED_SWITCH[FEED_COUNT] = { "UseNormalTexture", "Integration_Albedo", "Integration_Motion", "Integration_Material", "Integration_HDRScene",
+                                                     "Integration_Scene" };
 static const char *const FEED_SWITCH_LABEL[FEED_COUNT] = { "Use Game Normals If Provided", "Use Game Albedo If Provided", "Use Game Motion Vectors If Provided",
-                                                           "Use Game Material (reflectivity) If Provided", "Use Game HDR Scene Light If Provided" };
+                                                           "Use Game Material (reflectivity) If Provided", "Use Game HDR Scene Light If Provided",
+                                                           "Use Game Finished Frame If Provided" };
 
-// What a layer probably is, from how it is drawn (Layers tab, auto-setup). A heuristic, shown as a hint.
+// What a layer probably is, from how it is drawn (Layers tab). A heuristic, shown as a hint.
 enum LayerKind : int { LK_UNKNOWN = 0, LK_GBUFFER, LK_OPAQUE, LK_LIGHTING, LK_TRANSPARENT, LK_POST, LK_UI, LK_COUNT };
 static const char *const LK_LABEL[LK_COUNT] = { "?", "G-buffer", "Geometry", "Lighting", "Transparent", "Post-process", "UI / overlay" };
 
 // Remappable key actions (Keys tab). Repeating actions fire again while the key is held.
 enum KeyAction : int
 {
-    KA_TOGGLE = 0, KA_LEVEL_DOWN, KA_LEVEL_UP, KA_LAYER_PREV, KA_LAYER_NEXT, KA_INJECT_HERE, KA_ROLE_PREV, KA_ROLE_NEXT,
-    KA_AUTO_SETUP, KA_AUTO_FEEDS, KA_RECORD, KA_COUNT
+    KA_TOGGLE = 0, KA_LEVEL_DOWN, KA_LEVEL_UP, KA_LAYER_PREV, KA_LAYER_NEXT, KA_FRAME_END_HERE, KA_ROLE_PREV, KA_ROLE_NEXT, KA_RECORD, KA_COUNT
 };
 static const char *const KA_LABEL[KA_COUNT] = {
-    "Integration on / off", "Level down", "Level up", "Previous layer", "Next layer", "Render CRCGI at the selected layer",
-    "Previous role of the selected layer", "Next role of the selected layer", "Auto-setup (injection layer + all feeds)",
-    "Auto-detect feeds only (replace)", "Record the layer list again" };
-static const bool KA_REPEAT[KA_COUNT] = { false, false, false, true, true, false, true, true, false, false, false };
+    "Integration on / off", "Level down", "Level up", "Previous layer", "Next layer", "Selected layer = finished frame",
+    "Previous role of the selected layer", "Next role of the selected layer", "Record the layer list again" };
+static const char *const KA_NAME[KA_COUNT] = { "Toggle", "LevelDown", "LevelUp", "LayerPrev", "LayerNext", "FrameEndHere", "RolePrev", "RoleNext", "Record" };
+static const bool KA_REPEAT[KA_COUNT] = { false, false, false, true, true, false, true, true, false };
 struct KeyBind
 {
     uint32_t key = 0;               // virtual key code, 0 = unbound
     bool ctrl = false, shift = false, alt = false;
 };
 static const KeyBind KA_DEFAULT[KA_COUNT] = {
-    { VK_NUMPAD0 }, { VK_NUMPAD7 }, { VK_NUMPAD9 }, { VK_NUMPAD8 }, { VK_NUMPAD2 }, { VK_NUMPAD5 }, { VK_NUMPAD4 }, { VK_NUMPAD6 },
-    { VK_NUMPAD1 }, { VK_NUMPAD3 }, { VK_DECIMAL } };
+    { VK_NUMPAD0 }, { VK_NUMPAD7 }, { VK_NUMPAD9 }, { VK_NUMPAD8 }, { VK_NUMPAD2 }, { VK_NUMPAD5 }, { VK_NUMPAD4 }, { VK_NUMPAD6 }, { VK_DECIMAL } };
 
 // Layer list sort orders.
 enum SortMode : int { SORT_FRAME = 0, SORT_RES_FRAME, SORT_KIND_FRAME, SORT_DRAWS, SORT_FORMAT_FRAME, SORT_ROLE_FRAME, SORT_COUNT };
@@ -137,24 +143,31 @@ static float upscale_fraction(int mode, float custom_pct)
     }
 }
 
-// Where Auto-setup puts the injection layer.
-enum InjectPolicy : int { IP_BEFORE_UI = 0, IP_BEFORE_POST, IP_BEFORE_TRANSPARENT, IP_COUNT };
-static const char INJECT_POLICY_ITEMS[] = "Before the UI (safest, after all post-processing)\0Before post-processing (first full-screen pass after the scene)\0Before transparent effects (fog, particles, glass)\0";
-
 // Where the camera values written to the shader come from.
 enum CamSource : int { CAM_NONE = 0, CAM_DETECTED, CAM_PICKED };
 
 // Version of the settings file format (crcgi_injector.ini next to the game's executable).
-static const int SETTINGS_VERSION = 1;
+static const int SETTINGS_VERSION = 2;
 
 // A game texture, identified across runs: its description plus its index among the live textures with the same description at
 // the time it was created (games create their render targets in a fixed order).
+//
+// rw / rh: the texture's size in thousandths of the back buffer's size when it was seen (0 = unknown). A saved target listing that is
+// shared between players (different screen resolutions) still finds the texture: same format, usage and creation order, and the
+// same size relative to the screen.
 struct TexSig
 {
-    uint32_t fmt = 0, w = 0, h = 0, samples = 1, usage = 0, ordinal = 0;
+    uint32_t fmt = 0, w = 0, h = 0, samples = 1, usage = 0, ordinal = 0, rw = 0, rh = 0;
     bool valid() const { return w != 0 && h != 0; }
     bool same_desc(const TexSig &o) const { return fmt == o.fmt && w == o.w && h == o.h && samples == o.samples && usage == o.usage; }
     bool operator==(const TexSig &o) const { return same_desc(o) && ordinal == o.ordinal; }
+    bool same_kind(const TexSig &o) const { return fmt == o.fmt && samples == o.samples && usage == o.usage; }
+    // Same texture at another screen resolution: same kind and creation order, size within 0.3% of the screen (relative).
+    bool same_relative(const TexSig &o) const
+    {
+        auto near_ = [](uint32_t a, uint32_t b) { return a != 0 && b != 0 && (a > b ? a - b : b - a) <= 3; };
+        return same_kind(o) && ordinal == o.ordinal && near_(rw, o.rw) && near_(rh, o.rh);
+    }
 };
 
 enum FeedSource : int { SRC_LAYER = 0, SRC_TEXTURE = 1 };
@@ -245,6 +258,22 @@ struct TrackState
     void clear() { *this = TrackState(); }
 };
 
+// Captures that cannot be taken yet because the command list is inside a render pass (Direct3D 12 BeginRenderPass: nothing may be
+// copied until the pass has ended) or because a compute dispatch that writes the texture has not run yet. They are taken at the next
+// event of the same command list outside a render pass (draw, dispatch, binding change, barrier).
+struct CaptureTodo { int feed = 0; int slot = 0; };
+struct PendingCapture
+{
+    uint64_t frame = 0;
+    uint64_t key = 0;
+    uint32_t rt_count = 0;
+    RtSlot rt[8];
+    std::vector<CaptureTodo> todo;
+    bool prev = false;
+    int prev_slot = 0;
+    bool snapshots = false;
+};
+
 struct CRCGI_UUID("FB2E1E5D-B900-4C39-9EEE-3B1AD6F285FD") CmdState
 {
     uint64_t frame = ~0ull;
@@ -272,6 +301,9 @@ struct CRCGI_UUID("FB2E1E5D-B900-4C39-9EEE-3B1AD6F285FD") CmdState
     std::unordered_map<uint64_t, uint32_t> occ;
     uint64_t occ_frame = ~0ull;
     bool in_render_pass = false;   // between begin_render_pass and end_render_pass: no copies, no injection
+    std::vector<PendingCapture> pending;
+    resource uav[16] = {};         // unordered-access views bound for compute (Direct3D 10 / 11, where the API shows the views)
+    uint32_t dispatches = 0;
     TrackState trk;
 };
 CRCGI_MINGW_UUID(CmdState, 0xfb2e1e5d, 0xb900, 0x4c39, 0x9e, 0xee, 0x3b, 0x1a, 0xd6, 0xf2, 0x85, 0xfd)
@@ -293,6 +325,7 @@ struct FeedTex
     bool srgb_source = false;     // the game wrote it through an sRGB view
     uint64_t frame = ~0ull;       // frame of the last successful capture
     uint64_t cl = 0;              // command list it was captured on
+    uint64_t cap_key = 0;         // layer key of the binding it was captured at this frame (a later capture of another binding is refused)
     uint64_t bound_frame = ~0ull; // frame in which the injection last handed it to the shader
     std::string status;           // why the last capture or binding did not happen (empty = fine)
 };
@@ -354,6 +387,9 @@ struct Globals
     bool only_useful = true;                    // layer list: hide targets that cannot be used for anything
     bool cross_list_feeds = true;               // accept feeds recorded on another command list (D3D12 records G-buffer and lighting apart)
     bool d3d12_inject = true;                   // D3D12: in-frame injection with the add-on's own state tracker (experimental)
+    bool force_inject = false;                  // advanced: render the effect inside the frame at the "Force render here" layer
+    bool only_always = true;                    // layer list: only layers that are drawn every frame
+    std::string profile_author, profile_notes;  // shown in a shared target listing
     bool verbose_log = false;
     LayerRef role_ref[ROLE_COUNT];              // inject / depth (normals/albedo/motion live in feeds)
     FeedConfig feed[FEED_COUNT];
@@ -368,7 +404,7 @@ struct Globals
     uint32_t bb_w = 0, bb_h = 0;
     format bb_fmt = format::unknown;
     resource bb_res = { 0 };
-    uint64_t frame = 0;
+    std::atomic<uint64_t> frame{ 0 };           // read by worker threads that record command lists: never a plain integer
     bool in_eof = false;
     uint64_t injected_frame = ~0ull;
     bool injected_float = false;                // diagnostic only: the injection target has a floating-point format
@@ -395,12 +431,9 @@ struct Globals
     float upscale_pct = 66.7f;
     uint32_t rr_w = 0, rr_h = 0;                // render resolution in use (detected or from the preset), 0 = native only
 
-    // auto-setup and auto re-detect
-    int inject_policy = IP_BEFORE_UI;
-    bool auto_redetect = true;                  // re-run the feed detection when an assigned texture is destroyed or goes stale
-    uint64_t feed_lost_frame[FEED_COUNT] = {};  // frame in which a feed's texture was destroyed (0 = not lost)
-    uint64_t redetect_frame = 0;                // last automatic re-detection
-    std::string auto_report;                    // what the last auto-setup did
+    // feeds taken from a texture: the frame a feed's texture was destroyed in (0 = not lost)
+    uint64_t feed_lost_frame[FEED_COUNT] = {};
+    uint64_t rematch_frame = 0;                 // last time the pool was searched for the textures of saved feeds
     int geom_source = 1;                        // shader's Geometry Source while game normals are delivered (0 rebuild, 1 game where valid, 2 game only)
 
     // keys
@@ -419,7 +452,7 @@ struct Globals
 
     // statistics (Debug tab)
     uint64_t n_injections = 0, n_inject_refused = 0, n_captures_interval = 0, n_captures_barrier = 0, n_eof_feed_frames = 0;
-    std::string tracker_report;                 // last D3D12 tracker check at the injection layer
+    std::string tracker_report;                 // last D3D12 tracker check at the forced layer
 
     int sel_pass = -1;                          // selection in the list (index into `last`)
     int sel_slot = 0;
@@ -716,6 +749,9 @@ static bool api_supports_injection(device_api api)
     return api == device_api::d3d10 || api == device_api::d3d11 || (api == device_api::d3d12 && g.d3d12_inject);
 }
 
+// Explicit-state APIs: the add-on must know the state of a resource before it touches it (barriers are never guessed).
+static bool explicit_states(device *d) { return d->get_api() == device_api::d3d12 || d->get_api() == device_api::vulkan; }
+
 // Material feeds (copies of game textures, bound at the injection point or at the end of the frame) work on every API except D3D9.
 static bool api_supports_feeds(device_api api)
 {
@@ -771,7 +807,7 @@ static std::filesystem::path module_directory()
     return std::filesystem::path();
 }
 
-static void write_ref(std::ofstream &f, const char *name, const LayerRef &r)
+static void write_ref(std::ostream &f, const char *name, const LayerRef &r)
 {
     f << name << "=" << hex16(r.key) << ":" << r.slot << "\n";
 }
@@ -787,81 +823,137 @@ static LayerRef parse_ref(const std::string &v)
     return r;
 }
 
-// Call with g.mtx held.
-static void save_settings_locked()
+static const char *const KEY_SECTION = "Keys";
+
+static void write_tex_sig(std::ostream &f, const TexSig &s)
 {
-    if (g.ini_path.empty())
-        return;
-    std::filesystem::path tmp = g.ini_path;
+    f << s.fmt << ":" << s.w << ":" << s.h << ":" << s.samples << ":" << s.usage << ":" << s.ordinal << ":" << s.rw << ":" << s.rh;
+}
+
+// The settings file (also the shareable target listing): targets_only writes just what describes the game's targets and the
+// author's notes, no keys and no overlay preferences. Call with g.mtx held.
+static void write_config(std::ostream &f, bool targets_only)
+{
+    f << "; CRCGI Injector " << (targets_only ? "target listing (shareable: copy it next to the game's executable and use Options > Import)" : "settings") << "\n";
+    if (targets_only)
+    {
+        char exe[MAX_PATH] = {};
+        GetModuleFileNameA(nullptr, exe, MAX_PATH);
+        std::string name = exe;
+        const size_t slash = name.find_last_of("\\/");
+        if (slash != std::string::npos)
+            name = name.substr(slash + 1);
+        f << "[Profile]\nGame=" << name << "\nApi=" << api_name(g.api) << "\nBackBuffer=" << g.bb_w << "x" << g.bb_h << "\nAuthor=" << g.profile_author
+          << "\nNotes=" << g.profile_notes << "\n\n";
+    }
+    f << "[General]\nVersion=" << SETTINGS_VERSION << "\nLevel=" << g.level << "\nGeomSource=" << g.geom_source
+      << "\nUpscaleMode=" << g.upscale_mode << "\nUpscalePct=" << g.upscale_pct << "\n";
+    if (!targets_only)
+        f << "ForceInject=" << g.force_inject << "\n";
+    if (!targets_only)
+        f << "Master=" << g.master << "\nFallbackEnd=" << g.fallback_end << "\nDepthLive=" << g.depth_live << "\nOnlyUseful=" << g.only_useful
+          << "\nOnlyAlways=" << g.only_always << "\nCrossListFeeds=" << g.cross_list_feeds << "\nD3D12Inject=" << g.d3d12_inject
+          << "\nVerboseLog=" << g.verbose_log << "\nSortMode=" << g.sort_mode << "\nAddNewLayers=" << g.cat_add_new
+          << "\nRepeatDelay=" << g.repeat_delay_ms << "\nRepeatRate=" << g.repeat_rate_ms << "\nAuthor=" << g.profile_author
+          << "\nNotes=" << g.profile_notes << "\n";
+    if (!targets_only)
+        write_ref(f, "Inject", g.role_ref[ROLE_INJECT]);         // a forced-render layer is a per-machine choice, never part of a shared listing
+    write_ref(f, "Depth", g.role_ref[ROLE_DEPTH]);
+    if (!targets_only)
+    {
+        f << "Techniques=";
+        for (size_t i = 0; i < g.techniques.size(); i++)
+            f << (i ? ";" : "") << g.techniques[i];
+        f << "\n";
+    }
+    f << "\n[Camera]\nAuto=" << g.cam_auto << "\nApply=" << g.cam_apply << "\nSig=" << g.cam_sig << "\n\n";
+    for (int i = 0; i < FEED_COUNT; i++)
+    {
+        const FeedConfig &c = g.feed[i];
+        f << "[Feed" << i << "]\n";
+        write_ref(f, "Ref", c.ref);
+        f << "Source=" << c.source << "\nTex=";
+        write_tex_sig(f, c.tex);
+        f << "\nEnabled=" << c.enabled << "\nSync=" << c.sync << "\nMode=" << c.mode << "\nSpace=" << c.space << "\nUnits=" << c.units
+          << "\nFlipY=" << c.flip_y << "\nInvert=" << c.invert << "\nChannel=" << c.channel << "\nMeaning=" << c.meaning << "\n\n";
+    }
+    if (!targets_only)
+    {
+        f << "[" << KEY_SECTION << "]\n";
+        for (int i = 0; i < KA_COUNT; i++)
+            f << KA_NAME[i] << "=" << g.keys[i].key << ":" << g.keys[i].ctrl << ":" << g.keys[i].shift << ":" << g.keys[i].alt << "\n";
+    }
+}
+
+// Writes a file in one step (temporary file, then rename). Call with g.mtx held.
+static bool write_file_locked(const std::filesystem::path &path, bool targets_only, std::string &error)
+{
+    if (path.empty())
+        return false;
+    std::filesystem::path tmp = path;
     tmp += L".tmp";
     {
         std::ofstream f(tmp, std::ios::trunc);
         if (!f)
         {
-            g.settings_error = "Cannot write the settings file next to the game executable (read-only folder?). Settings are not saved.";
-            return;
+            error = "Cannot write " + path.filename().u8string() + " next to the game executable (read-only folder?).";
+            return false;
         }
-        f << "[General]\n";
-        f << "Version=" << SETTINGS_VERSION << "\nMaster=" << g.master << "\nLevel=" << g.level << "\nFallbackEnd=" << g.fallback_end
-          << "\nDepthLive=" << g.depth_live << "\nOnlyUseful=" << g.only_useful << "\nCrossListFeeds=" << g.cross_list_feeds
-          << "\nD3D12Inject=" << g.d3d12_inject << "\nVerboseLog=" << g.verbose_log << "\nSortMode=" << g.sort_mode
-          << "\nUpscaleMode=" << g.upscale_mode << "\nUpscalePct=" << g.upscale_pct << "\nInjectPolicy=" << g.inject_policy
-          << "\nAutoRedetect=" << g.auto_redetect << "\nGeomSource=" << g.geom_source << "\nAddNewLayers=" << g.cat_add_new
-          << "\nRepeatDelay=" << g.repeat_delay_ms << "\nRepeatRate=" << g.repeat_rate_ms << "\n";
-        write_ref(f, "Inject", g.role_ref[ROLE_INJECT]);
-        write_ref(f, "Depth", g.role_ref[ROLE_DEPTH]);
-        f << "Techniques=";
-        for (size_t i = 0; i < g.techniques.size(); i++)
-            f << (i ? ";" : "") << g.techniques[i];
-        f << "\n\n[Camera]\nAuto=" << g.cam_auto << "\nApply=" << g.cam_apply << "\nSig=" << g.cam_sig << "\n\n";
-        for (int i = 0; i < FEED_COUNT; i++)
-        {
-            const FeedConfig &c = g.feed[i];
-            f << "[Feed" << i << "]\n";
-            write_ref(f, "Ref", c.ref);
-            f << "Source=" << c.source << "\nTex=" << c.tex.fmt << ":" << c.tex.w << ":" << c.tex.h << ":" << c.tex.samples << ":" << c.tex.usage
-              << ":" << c.tex.ordinal << "\nEnabled=" << c.enabled << "\nSync=" << c.sync << "\nMode=" << c.mode << "\nSpace=" << c.space
-              << "\nUnits=" << c.units << "\nFlipY=" << c.flip_y << "\nInvert=" << c.invert << "\nChannel=" << c.channel
-              << "\nMeaning=" << c.meaning << "\n\n";
-        }
-        f << "[Keys]\n";
-        for (int i = 0; i < KA_COUNT; i++)
-            f << "Key" << i << "=" << g.keys[i].key << ":" << g.keys[i].ctrl << ":" << g.keys[i].shift << ":" << g.keys[i].alt << "\n";
+        write_config(f, targets_only);
         f.flush();
         if (!f)
         {
-            g.settings_error = "Writing the settings file failed (disk full?). Settings are not saved.";
-            return;
+            error = "Writing " + path.filename().u8string() + " failed (disk full?).";
+            return false;
         }
     }
     std::error_code ec;
-    std::filesystem::rename(tmp, g.ini_path, ec);                   // replaces the old file in one step
+    std::filesystem::rename(tmp, path, ec);                         // replaces the old file in one step
     if (ec)
     {
-        g.settings_error = "Cannot replace the settings file: " + ec.message();
+        error = "Cannot replace " + path.filename().u8string() + ": " + ec.message();
         std::filesystem::remove(tmp, ec);
-        return;
+        return false;
     }
-    g.settings_error.clear();
+    return true;
 }
 
-static void load_settings()
+// Call with g.mtx held.
+static void save_settings_locked()
 {
-    std::lock_guard<std::mutex> lock(g.mtx);
-    if (g.ini_path.empty())
-    {
-        g.settings_error = "The game's folder could not be determined: defaults are used and settings are not saved.";
-        return;
-    }
-    for (int i = 0; i < KA_COUNT; i++)
-        g.keys[i] = KA_DEFAULT[i];                                  // defaults first; the file overrides what it has
-    std::ifstream f(g.ini_path);
+    std::string err;
+    if (write_file_locked(g.ini_path, false, err))
+        g.settings_error.clear();
+    else if (!g.ini_path.empty())
+        g.settings_error = err + " Settings are not saved.";
+}
+
+static TexSig parse_tex_sig(const std::string &v)
+{
+    TexSig s;
+    std::vector<std::string> t = split(v, ':');
+    if (t.size() != 6 && t.size() != 8)
+        return s;
+    auto u = [&](size_t i) { return static_cast<uint32_t>(std::strtoul(t[i].c_str(), nullptr, 10)); };
+    s.fmt = u(0); s.w = u(1); s.h = u(2); s.samples = u(3); s.usage = u(4); s.ordinal = u(5);
+    if (t.size() == 8) { s.rw = u(6); s.rh = u(7); }
+    return s;
+}
+
+// Reads a settings file or a shared target listing (targets_only: only the targets, never keys or overlay preferences). A missing,
+// unreadable or malformed file changes nothing it cannot read. Call with g.mtx held.
+static bool read_config_locked(const std::filesystem::path &path, bool targets_only, std::string &error)
+{
+    std::ifstream f(path);
     if (!f)
-        return;                                                     // first run: defaults
+    {
+        error = "Cannot open " + path.filename().u8string();
+        return false;
+    }
     std::string line, section;
-    int version = 1;
     bool cross_list = g.cross_list_feeds;
     bool sync_seen[FEED_COUNT] = {}, sync_val[FEED_COUNT] = {};
+    bool ref_seen[FEED_COUNT] = {};
     while (std::getline(f, line))
     {
         line = trim(line);
@@ -879,28 +971,36 @@ static void load_settings()
         auto b = [&] { return v == "1"; };
         if (section == "General")
         {
-            if (k == "Version") version = std::atoi(v.c_str());
-            else if (k == "Master") g.master = b();
-            else if (k == "Level") g.level = std::clamp(std::atoi(v.c_str()), 0, 2);
-            else if (k == "FallbackEnd") g.fallback_end = b();
-            else if (k == "DepthLive") g.depth_live = b();
-            else if (k == "OnlyUseful") g.only_useful = b();
-            else if (k == "CrossListFeeds") cross_list = b();
-            else if (k == "D3D12Inject") g.d3d12_inject = b();
-            else if (k == "VerboseLog") g.verbose_log = b();
-            else if (k == "SortMode") g.sort_mode = std::clamp(std::atoi(v.c_str()), 0, SORT_COUNT - 1);
+            if (k == "Level") g.level = std::clamp(std::atoi(v.c_str()), 0, 2);
+            else if (k == "ForceInject") { if (!targets_only) g.force_inject = b(); }
+            else if (k == "GeomSource") g.geom_source = std::clamp(std::atoi(v.c_str()), 0, 2);
             else if (k == "UpscaleMode") g.upscale_mode = std::clamp(std::atoi(v.c_str()), 0, UP_COUNT - 1);
             else if (k == "UpscalePct") g.upscale_pct = std::clamp(static_cast<float>(std::atof(v.c_str())), 20.0f, 100.0f);
-            else if (k == "InjectPolicy") g.inject_policy = std::clamp(std::atoi(v.c_str()), 0, IP_COUNT - 1);
-            else if (k == "AutoRedetect") g.auto_redetect = b();
-            else if (k == "GeomSource") g.geom_source = std::clamp(std::atoi(v.c_str()), 0, 2);
-            else if (k == "AddNewLayers") g.cat_add_new = b();
-            else if (k == "RepeatDelay") g.repeat_delay_ms = std::clamp(std::atoi(v.c_str()), 100, 1500);
-            else if (k == "RepeatRate") g.repeat_rate_ms = std::clamp(std::atoi(v.c_str()), 15, 500);
-            else if (k == "AutoTonemap") {}                         // version 1 setting: removed, ignored on purpose
-            else if (k == "Inject") g.role_ref[ROLE_INJECT] = parse_ref(v);
+            else if (k == "Inject") { if (!targets_only) g.role_ref[ROLE_INJECT] = parse_ref(v); }
             else if (k == "Depth") g.role_ref[ROLE_DEPTH] = parse_ref(v);
-            else if (k == "Techniques") g.techniques = split(v, ';');
+            else if (!targets_only)
+            {
+                if (k == "Master") g.master = b();
+                else if (k == "FallbackEnd") g.fallback_end = b();
+                else if (k == "DepthLive") g.depth_live = b();
+                else if (k == "OnlyUseful") g.only_useful = b();
+                else if (k == "OnlyAlways") g.only_always = b();
+                else if (k == "CrossListFeeds") cross_list = b();
+                else if (k == "D3D12Inject") g.d3d12_inject = b();
+                else if (k == "VerboseLog") g.verbose_log = b();
+                else if (k == "SortMode") g.sort_mode = std::clamp(std::atoi(v.c_str()), 0, SORT_COUNT - 1);
+                else if (k == "AddNewLayers") g.cat_add_new = b();
+                else if (k == "RepeatDelay") g.repeat_delay_ms = std::clamp(std::atoi(v.c_str()), 100, 1500);
+                else if (k == "RepeatRate") g.repeat_rate_ms = std::clamp(std::atoi(v.c_str()), 15, 500);
+                else if (k == "Author") g.profile_author = v.substr(0, 120);
+                else if (k == "Notes") g.profile_notes = v.substr(0, 400);
+                else if (k == "Techniques") g.techniques = split(v, ';');
+            }
+        }
+        else if (section == "Profile")
+        {
+            if (k == "Author") g.profile_author = v.substr(0, 120);
+            else if (k == "Notes") g.profile_notes = v.substr(0, 400);
         }
         else if (section == "Camera")
         {
@@ -914,23 +1014,11 @@ static void load_settings()
             if (i < 0 || i >= FEED_COUNT)
                 continue;
             FeedConfig &c = g.feed[i];
-            if (k == "Ref") c.ref = parse_ref(v);
+            if (k == "Ref") { c.ref = parse_ref(v); ref_seen[i] = true; }
             else if (k == "Enabled") c.enabled = b();
             else if (k == "Sync") { sync_seen[i] = true; sync_val[i] = b(); }
             else if (k == "Source") c.source = std::clamp(std::atoi(v.c_str()), 0, 1);
-            else if (k == "Tex")
-            {
-                std::vector<std::string> t = split(v, ':');
-                if (t.size() == 6)
-                {
-                    c.tex.fmt = static_cast<uint32_t>(std::strtoul(t[0].c_str(), nullptr, 10));
-                    c.tex.w = static_cast<uint32_t>(std::strtoul(t[1].c_str(), nullptr, 10));
-                    c.tex.h = static_cast<uint32_t>(std::strtoul(t[2].c_str(), nullptr, 10));
-                    c.tex.samples = static_cast<uint32_t>(std::strtoul(t[3].c_str(), nullptr, 10));
-                    c.tex.usage = static_cast<uint32_t>(std::strtoul(t[4].c_str(), nullptr, 10));
-                    c.tex.ordinal = static_cast<uint32_t>(std::strtoul(t[5].c_str(), nullptr, 10));
-                }
-            }
+            else if (k == "Tex") c.tex = parse_tex_sig(v);
             else if (k == "Space") c.space = std::clamp(std::atoi(v.c_str()), 0, 1);
             else if (k == "Mode") c.mode = std::clamp(std::atoi(v.c_str()), 0, 2);
             else if (k == "Units") c.units = std::clamp(std::atoi(v.c_str()), 0, 2);
@@ -939,22 +1027,51 @@ static void load_settings()
             else if (k == "Channel") c.channel = std::clamp(std::atoi(v.c_str()), 0, 3);
             else if (k == "Meaning") c.meaning = std::clamp(std::atoi(v.c_str()), 0, 3);
         }
-        else if (section == "Keys" && k.rfind("Key", 0) == 0)
+        else if (!targets_only && section == KEY_SECTION)
         {
-            const int i = std::atoi(k.c_str() + 3);
-            std::vector<std::string> t = split(v, ':');
-            if (i >= 0 && i < KA_COUNT && t.size() == 4)
-            {
-                g.keys[i].key = static_cast<uint32_t>(std::strtoul(t[0].c_str(), nullptr, 10)) & 0xFF;
-                g.keys[i].ctrl = t[1] == "1";
-                g.keys[i].shift = t[2] == "1";
-                g.keys[i].alt = t[3] == "1";
-            }
+            for (int i = 0; i < KA_COUNT; i++)
+                if (k == KA_NAME[i])
+                {
+                    std::vector<std::string> t = split(v, ':');
+                    if (t.size() == 4)
+                    {
+                        g.keys[i].key = static_cast<uint32_t>(std::strtoul(t[0].c_str(), nullptr, 10)) & 0xFF;
+                        g.keys[i].ctrl = t[1] == "1";
+                        g.keys[i].shift = t[2] == "1";
+                        g.keys[i].alt = t[3] == "1";
+                    }
+                }
         }
     }
     for (int i = 0; i < FEED_COUNT; i++)
+    {
         g.feed[i].sync = sync_seen[i] ? sync_val[i] : false;        // the shader's switches stay yours unless 'Drive the shader's switch' is ticked
-    g.cross_list_feeds = cross_list;
-    if (version < SETTINGS_VERSION)
-        g.dirty = true;                                             // rewrite in the current format on the next frame
+        if (targets_only)
+        {
+            g.feed_res[i] = resource{ 0 };                          // found again by the pool (rematch_feeds)
+            g.feed_lost_frame[i] = std::max<uint64_t>(g.frame, 1);
+        }
+        (void)ref_seen[i];
+    }
+    g.rematch_frame = 0;
+    if (!targets_only)
+        g.cross_list_feeds = cross_list;
+    return true;
+}
+
+static void load_settings()
+{
+    std::lock_guard<std::mutex> lock(g.mtx);
+    if (g.ini_path.empty())
+    {
+        g.settings_error = "The game's folder could not be determined: defaults are used and settings are not saved.";
+        return;
+    }
+    for (int i = 0; i < KA_COUNT; i++)
+        g.keys[i] = KA_DEFAULT[i];                                  // defaults first; the file overrides what it has
+    std::error_code ec;
+    if (!std::filesystem::exists(g.ini_path, ec))
+        return;                                                     // first run: defaults
+    std::string err;
+    read_config_locked(g.ini_path, false, err);
 }

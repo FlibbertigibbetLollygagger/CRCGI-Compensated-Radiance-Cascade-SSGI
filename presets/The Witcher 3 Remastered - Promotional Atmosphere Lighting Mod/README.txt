@@ -1,3 +1,5 @@
+Update v1.2: Added a preset that is compatible with v1.2, it is exactly the same as 1.1 preset
+
 Quick Performance note: Enable Reshade's Performance Mode after tuning is done. It helps a lot, especially with these complicated shaders.
 
 

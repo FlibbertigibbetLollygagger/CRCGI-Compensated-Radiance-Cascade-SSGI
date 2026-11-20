@@ -26,8 +26,10 @@ struct Analysis
     float z_one_sign = 0.0f;           // fraction of the dominant sign of the vector's z (view-space normals: mostly one sign)
     float hdr_frac = 0.0f;             // fraction with a channel > 1.05
     float small2_frac = 0.0f;          // two-channel: fraction of |rg| < 0.02 (UV-sized motion)
+    float small4_frac = 0.0f;          // four-channel: fraction of |rg| < 0.02 (velocity in rg, something else in ba)
+    float luma_mean = 0.0f;
     float zero_frac = 0.0f;
-    float s_albedo = 0.0f, s_normal = 0.0f, s_motion = 0.0f, s_material = 0.0f, s_hdr = 0.0f;
+    float s_albedo = 0.0f, s_normal = 0.0f, s_motion = 0.0f, s_material = 0.0f, s_hdr = 0.0f, s_scene = 0.0f;
     std::string label;
     float score(int feed) const
     {
@@ -37,6 +39,7 @@ struct Analysis
         case FEED_ALBEDO: return s_albedo;
         case FEED_MOTION: return s_motion;
         case FEED_MATERIAL: return s_material;
+        case FEED_SCENE: return s_scene;
         default: return s_hdr;
         }
     }
@@ -55,6 +58,14 @@ struct PoolTex
     bool cur_depth = false;
     uint32_t l_binds = 0, l_draws = 0, l_mrt = 0, l_slot = 8, l_order = UINT32_MAX;
     bool l_depth = false;
+    // The binding interval that drew most to this texture (its "main" interval): captures of a feed taken from the texture happen
+    // only there, because engines reuse transient texture memory later in the frame for unrelated passes.
+    uint64_t cur_main_key = 0, l_main_key = 0;
+    uint32_t cur_main_draws = 0, l_main_draws = 0;
+    bool cur_main_seen = false;          // the interval that was main so far occurred again in the frame being recorded
+    uint32_t main_missing = 0;           // consecutive frames in which it did not
+    uint32_t cur_dispatches = 0, l_dispatches = 0;   // compute dispatches that wrote it (where the API shows the bindings)
+    uint32_t cur_clears = 0;
     uint64_t last_used = ~0ull;
     // snapshot + analysis
     bool snap_want = false;
@@ -74,10 +85,7 @@ struct Profiler
     uint64_t snapshot_frame = 0;
     int snap_limit = 16;
     int filter = 1;                      // 0 all, 1 same aspect as the screen and at least half its size, 2 exactly the screen's size
-    bool auto_assign_pending = false;    // "Auto-detect": assign the best candidates once the analysis is done
-    bool auto_replace = false;           // ... replacing feeds that already have a texture
     uint64_t selected = 0;
-    std::string last_auto;               // what the last auto-detect did
     uint64_t rr_check_frame = 0;         // render-resolution detection runs every 60 frames
     uint64_t detected_rr = 0;            // (w << 32) | h of the detected render resolution, 0 = none
 };
@@ -99,6 +107,23 @@ static bool pool_candidate_size(const PoolTex &t, int filter)
     return true;
 }
 
+// True when `key` is the binding interval that drew most to the texture in the last frame. Unknown (no frame seen yet) = false, so a
+// feed is never captured from an interval that may be unrelated reuse of the same memory.
+static bool pool_is_main_interval(resource res, uint64_t key)
+{
+    std::lock_guard<std::mutex> lock(prof.m);
+    auto it = prof.pool.find(res.handle);
+    return it != prof.pool.end() && it->second.l_main_key != 0 && it->second.l_main_key == key;
+}
+
+// True once the texture's main interval has ended in the frame being recorded (barrier-based captures wait for it).
+static bool pool_main_seen(resource res)
+{
+    std::lock_guard<std::mutex> lock(prof.m);
+    auto it = prof.pool.find(res.handle);
+    return it != prof.pool.end() && it->second.l_main_key != 0 && it->second.cur_main_seen;
+}
+
 // ---------------------------------------------------------------------------------------------------------------------
 // Pool maintenance
 // ---------------------------------------------------------------------------------------------------------------------
@@ -112,7 +137,8 @@ static void match_feed_textures(resource res, const TexSig &sig)
         FeedConfig &f = g.feed[i];
         if (f.source != SRC_TEXTURE || !f.tex.valid())
             continue;
-        if (f.tex == sig || (g.feed_res[i].handle == 0 && g.feed_lost_frame[i] != 0 && f.tex.same_desc(sig)))
+        const bool lost = g.feed_res[i].handle == 0;
+        if (f.tex == sig || (lost && (g.feed_lost_frame[i] != 0 && f.tex.same_desc(sig))) || (lost && f.tex.same_relative(sig)))
         {
             g.feed_res[i] = res;
             if (!(f.tex == sig))
@@ -123,6 +149,45 @@ static void match_feed_textures(resource res, const TexSig &sig)
             g.feed_lost_frame[i] = 0;
         }
     }
+}
+
+// The screen-relative size of a texture (thousandths of the back buffer), set once the back buffer is known.
+static void set_relative_size(TexSig &s)
+{
+    if (g.bb_w != 0 && g.bb_h != 0)
+    {
+        s.rw = static_cast<uint32_t>((static_cast<uint64_t>(s.w) * 1000 + g.bb_w / 2) / g.bb_w);
+        s.rh = static_cast<uint32_t>((static_cast<uint64_t>(s.h) * 1000 + g.bb_h / 2) / g.bb_h);
+    }
+}
+
+// Saved or imported feeds whose texture is not found yet (the pool was filled before the back buffer was known, or a listing from
+// another resolution was imported): look through the live textures again. Every 60 frames at most, only while something is missing.
+static void rematch_feeds()
+{
+    bool missing = false;
+    {
+        std::lock_guard<std::mutex> lock(g.mtx);
+        if (g.frame < g.rematch_frame + 60)
+            return;
+        for (int i = 0; i < FEED_COUNT; i++)
+            missing |= g.feed[i].source == SRC_TEXTURE && g.feed[i].tex.valid() && g.feed_res[i].handle == 0;
+        g.rematch_frame = g.frame;
+    }
+    if (!missing)
+        return;
+    std::vector<std::pair<resource, TexSig>> live;
+    {
+        std::lock_guard<std::mutex> lock(prof.m);
+        for (const auto &e : prof.pool)
+        {
+            TexSig s = e.second.sig;
+            set_relative_size(s);
+            live.emplace_back(e.second.res, s);
+        }
+    }
+    for (const auto &l : live)
+        match_feed_textures(l.first, l.second);
 }
 
 static void on_init_resource(device *dev, const resource_desc &d, const subresource_data *, resource_usage, resource res)
@@ -152,6 +217,7 @@ static void on_init_resource(device *dev, const resource_desc &d, const subresou
         while (std::find(used.begin(), used.end(), ord) != used.end())
             ord++;
         sig.ordinal = ord;
+        set_relative_size(sig);
         PoolTex &t = prof.pool[res.handle];
         t = PoolTex();
         t.res = res;
@@ -197,6 +263,26 @@ static uint64_t pool_identity(resource res)
     return fnv64(&it->second.sig, sizeof(TexSig));
 }
 
+// A compute dispatch that writes the texture (Direct3D 10 / 11: the bound unordered access views). The first dispatch that writes it in a
+// frame is its main one unless a draw interval writes it more.
+static void pool_note_compute(resource res, uint64_t key)
+{
+    std::lock_guard<std::mutex> lock(prof.m);
+    auto it = prof.pool.find(res.handle);
+    if (it == prof.pool.end())
+        return;
+    PoolTex &t = it->second;
+    t.cur_dispatches++;
+    t.last_used = g.frame;
+    if (key == t.l_main_key)
+        t.cur_main_seen = true;
+    if (t.cur_main_key == 0)
+    {
+        t.cur_main_key = key;
+        t.cur_main_draws = 1;
+    }
+}
+
 // Usage statistics of one finished binding interval.
 static void pool_note_interval(const CmdState &cs, uint32_t order)
 {
@@ -211,6 +297,13 @@ static void pool_note_interval(const CmdState &cs, uint32_t order)
         PoolTex &t = it->second;
         t.cur_binds++;
         t.cur_draws += cs.draws;
+        if (cs.pass_key == t.l_main_key)
+            t.cur_main_seen = true;
+        if (cs.draws > t.cur_main_draws)
+        {
+            t.cur_main_draws = cs.draws;
+            t.cur_main_key = cs.pass_key;
+        }
         t.cur_mrt = std::max(t.cur_mrt, cs.rt_count);
         t.cur_slot = std::min(t.cur_slot, s);
         t.cur_depth |= cs.dsv.handle != 0;
@@ -224,9 +317,11 @@ static void pool_note_interval(const CmdState &cs, uint32_t order)
 // ---------------------------------------------------------------------------------------------------------------------
 // Snapshot capture (called where the texture's state is known)
 // ---------------------------------------------------------------------------------------------------------------------
-// skip_if_have: D3D12 barrier path. A copy taken at the end of a binding is preferred there (the barrier event cannot tell a split
-// barrier's BEGIN_ONLY half from a full transition), so the barrier path only fills in what no binding end provided.
-static void pool_capture(command_list *cl, resource res, resource_usage state, format view_fmt, bool skip_if_have = false)
+// barrier_path: Vulkan, where nothing can be copied inside a render pass: the copy is taken right after the game's own barrier out of the
+// render-target state, but only once the texture's main binding has ended in this frame (later reuse of the memory is not captured)
+// and only if no capture was taken this frame yet. Direct3D 12 never captures at barriers: a split barrier's BEGIN_ONLY half cannot be
+// told from a full transition, and a copy between its halves is invalid.
+static void pool_capture(command_list *cl, resource res, resource_usage state, format view_fmt, bool barrier_path = false)
 {
     std::lock_guard<std::mutex> lock(prof.m);
     if (prof.snapshot_phase != 2)
@@ -235,7 +330,10 @@ static void pool_capture(command_list *cl, resource res, resource_usage state, f
     if (it == prof.pool.end() || !it->second.snap_want)
         return;
     PoolTex &t = it->second;
-    if (skip_if_have && t.snap.frame != ~0ull && t.snap.frame + 1 >= prof.snapshot_frame)
+    const bool have_this_frame = t.snap.frame != ~0ull && t.snap.frame >= prof.snapshot_frame;
+    if (have_this_frame)
+        return;                                              // one capture per texture in the snapshot frame
+    if (barrier_path && !(t.l_main_key != 0 && t.cur_main_seen))
         return;
     RtSlot src;
     src.res = res;
@@ -256,6 +354,33 @@ static void pool_end_frame()
     {
         PoolTex &t = e.second;
         t.l_binds = t.cur_binds; t.l_draws = t.cur_draws; t.l_mrt = t.cur_mrt; t.l_slot = t.cur_slot; t.l_depth = t.cur_depth; t.l_order = t.cur_order;
+        t.l_dispatches = t.cur_dispatches;
+        // The main binding only changes when the old one is gone for half a second or the new one draws more than twice as much, so a
+        // game that culls differently from frame to frame cannot make the capture point jump between two bindings.
+        if (t.cur_main_key != 0)
+        {
+            if (t.l_main_key == 0 || t.cur_main_key == t.l_main_key)
+            {
+                t.l_main_key = t.cur_main_key;
+                t.l_main_draws = t.cur_main_draws;
+                t.main_missing = 0;
+            }
+            else
+            {
+                t.main_missing = t.cur_main_seen ? 0 : t.main_missing + 1;
+                if (t.main_missing >= 30 || t.cur_main_draws > t.l_main_draws * 2)
+                {
+                    t.l_main_key = t.cur_main_key;
+                    t.l_main_draws = t.cur_main_draws;
+                    t.main_missing = 0;
+                }
+            }
+        }
+        t.cur_main_key = 0;
+        t.cur_main_draws = 0;
+        t.cur_main_seen = false;
+        t.cur_dispatches = 0;
+        t.cur_clears = 0;
         t.cur_binds = t.cur_draws = t.cur_mrt = 0;
         t.cur_slot = 8;
         t.cur_order = UINT32_MAX;
@@ -288,7 +413,7 @@ static void pool_end_frame()
         for (auto &e : prof.pool)
         {
             PoolTex &t = e.second;
-            if (t.snap_want && t.snap.frame != ~0ull && t.snap.frame + 1 >= prof.snapshot_frame && t.snap.srv.handle != 0)
+            if (t.snap_want && t.snap.frame != ~0ull && t.snap.frame >= prof.snapshot_frame && t.snap.srv.handle != 0)
             {
                 t.rb_state = 1;
                 t.an = Analysis();
@@ -304,7 +429,7 @@ static void pool_end_frame()
         // Candidates: used as a render target in the last frame, of a useful size, most-drawn first.
         std::vector<PoolTex *> c;
         for (auto &e : prof.pool)
-            if (e.second.l_binds > 0 && pool_candidate_size(e.second, prof.filter) && e.second.sig.samples == 1)
+            if ((e.second.l_binds > 0 || e.second.l_dispatches > 0) && pool_candidate_size(e.second, prof.filter) && e.second.sig.samples == 1)
                 c.push_back(&e.second);
         std::sort(c.begin(), c.end(), [](const PoolTex *a, const PoolTex *b) { return a->l_draws > b->l_draws; });
         if (c.size() > static_cast<size_t>(prof.snap_limit))
@@ -312,7 +437,7 @@ static void pool_end_frame()
         for (PoolTex *t : c)
             t->snap_want = true;
         prof.snapshot_phase = 2;
-        prof.snapshot_frame = g.frame + 1;   // the frame that starts now (g.frame is incremented right after this)
+        prof.snapshot_frame = g.frame + 1;   // the frame that starts now (g.frame is incremented right after this); a capture in it has frame == snapshot_frame
     }
 }
 
@@ -426,7 +551,7 @@ static void analyse(PoolTex &t, const uint8_t *data, uint32_t row_pitch)
     a.is_float = fmt_is_float(f) || f == format::r16_float || f == format::r32_float;
     a.is_unorm = !a.is_float && f != format::r8g8b8a8_snorm && f != format::r16g16b16a16_snorm && f != format::r16g16_snorm && f != format::r8g8_snorm;
     double sum[4] = {}, sq[4] = {};
-    uint64_t n = 0, unit_raw = 0, unit_unorm = 0, zpos_raw = 0, zpos_unorm = 0, nz = 0, hdr = 0, small2 = 0, zero = 0;
+    uint64_t n = 0, unit_raw = 0, unit_unorm = 0, zpos_raw = 0, zpos_unorm = 0, nz = 0, hdr = 0, small2 = 0, small4 = 0, zero = 0;
     for (uint32_t y = 0; y < RB_SIZE; y++)
     {
         const uint8_t *row = data + static_cast<size_t>(y) * row_pitch;
@@ -455,6 +580,7 @@ static void analyse(PoolTex &t, const uint8_t *data, uint32_t row_pitch)
                 if (u2 > 0.0f) zpos_unorm++;
             }
             if (ch == 2 && std::sqrt(px[0] * px[0] + px[1] * px[1]) < 0.02f) small2++;
+            if (ch == 4 && std::sqrt(px[0] * px[0] + px[1] * px[1]) < 0.02f) small4++;
         }
     }
     a.done = true;
@@ -471,6 +597,7 @@ static void analyse(PoolTex &t, const uint8_t *data, uint32_t row_pitch)
     a.zero_frac = static_cast<float>(zero) / n;
     a.hdr_frac = static_cast<float>(hdr) / n;
     a.small2_frac = static_cast<float>(small2) / n;
+    a.small4_frac = static_cast<float>(small4) / n;
     if (nz > 0)
     {
         const bool use_unorm = a.is_unorm && unit_unorm >= unit_raw;
@@ -489,36 +616,60 @@ static void analyse(PoolTex &t, const uint8_t *data, uint32_t row_pitch)
     // Octahedral normals in two channels: values spread over the square (not small like motion).
     if (a.channels == 2 && lively && a.small2_frac < 0.3f && var3 > 0.02f)
         a.s_normal = std::max(a.s_normal, 0.35f);
-    // Albedo: three or more channels in 0..1, not unit vectors, plausible mean, not HDR. sRGB views and 8-bit storage are typical.
+    // Albedo: three or more channels in 0..1, not unit vectors, plausible mean, not HDR. sRGB views and 8-bit storage are typical;
+    // a non-sRGB RGBA8 or R11G11B10 target is just as common (the game decodes the sRGB itself), so 4-byte storage alone clears the
+    // threshold unless something else speaks against it.
     if (a.channels >= 3 && lively && a.hdr_frac < 0.005f)
     {
-        float s = 0.45f;
-        s += a.srgb ? 0.25f : 0.0f;
-        s += (texel_size(t.fmt) == 4 && !a.is_float) ? 0.1f : 0.0f;
+        float s = 0.5f;
+        s += a.srgb ? 0.2f : 0.0f;
+        s += (texel_size(t.fmt) == 4) ? 0.12f : 0.0f;                       // RGBA8 / RGB10A2 / RG16 / R11G11B10: compact colour storage
         s -= std::clamp((a.unit_frac - 0.3f) * 1.5f, 0.0f, 0.6f);
         s -= (lum < 0.02f || lum > 0.9f) ? 0.3f : 0.0f;
         a.s_albedo = std::clamp(s, 0.0f, 1.0f);
     }
-    // Motion vectors: two channels, mostly tiny vectors (UV units) or a float format with a narrow distribution.
+    // Motion vectors: two channels, mostly tiny vectors (UV units) or a float format with a narrow distribution. Four channels:
+    // velocity in two of them (xy) and something else in the other two (depth, a mask): the xy pair must be small, the target must be
+    // float or signed, and it must not look like colour or like unit vectors.
     if (a.channels == 2)
     {
         float s = 0.3f + 0.6f * a.small2_frac;
         if (a.is_float) s += 0.1f;
         a.s_motion = std::clamp(s, 0.0f, 1.0f);
     }
+    else if (a.channels == 4 && (a.is_float || !a.is_unorm) && a.small4_frac > 0.5f && a.hdr_frac < 0.02f && a.unit_frac < 0.3f)
+    {
+        float s = 0.25f + 0.55f * a.small4_frac;
+        if (a.is_float) s += 0.1f;
+        a.s_motion = std::clamp(s, 0.0f, 0.95f);
+    }
+    a.luma_mean = lum;
     // Usage bonus: textures written together with others in one many-target binding with depth are G-buffer members.
     if (t.l_mrt >= 2 && t.l_depth)
     {
         a.s_albedo = std::min(1.0f, a.s_albedo + (a.s_albedo > 0 ? 0.1f : 0.0f) + (t.l_slot == 0 && a.s_albedo > 0 ? 0.05f : 0.0f));
         a.s_normal = std::min(1.0f, a.s_normal + (a.s_normal > 0 ? 0.1f : 0.0f));
     }
-    // HDR scene light: a floating-point colour target with values above 1 (the lighting before tonemapping), screen-sized.
-    if (a.channels >= 3 && a.is_float && a.hdr_frac > 0.003f && lively && a.unit_frac < 0.5f)
+    // HDR scene light: a floating-point colour target (the lighting before tonemapping). Values above 1 are typical outdoors and raise
+    // the score, but dark, indoor or overcast scenes keep everything inside 0..1, so they are a bonus, not a requirement.
+    if (a.channels >= 3 && a.is_float && lively && a.unit_frac < 0.5f && lum > 0.0005f && lum < 50.0f)
     {
-        float s = 0.55f + std::min(a.hdr_frac * 4.0f, 0.25f);
+        float s = 0.45f;
+        s += a.hdr_frac > 0.003f ? 0.1f + std::min(a.hdr_frac * 4.0f, 0.2f) : 0.0f;
         s += t.l_mrt <= 1 ? 0.1f : 0.0f;                                    // written alone (lighting / composite), not a G-buffer member
         s += t.l_draws >= 50 ? 0.1f : 0.0f;                                 // forward / transparent draws land in it
+        s += (t.sig.w == g.bb_w && t.sig.h == g.bb_h) || screen_sized(t.sig.w, t.sig.h) ? 0.05f : 0.0f;
         a.s_hdr = std::clamp(s, 0.0f, 1.0f);
+    }
+    // Finished frame: a screen-sized colour target in the back buffer's format family, drawn without depth by few draws, plausibly lit.
+    // Which of the late targets is the last one before the UI cannot be told from the contents: the layer list (Kind, position) helps.
+    if (a.channels >= 3 && lively && t.sig.w == g.bb_w && t.sig.h == g.bb_h && same_format_family(t.fmt, g.bb_fmt) && a.unit_frac < 0.5f &&
+        t.l_mrt <= 1 && !t.l_depth)
+    {
+        float s = 0.55f;
+        s += (lum > 0.02f && lum < 0.9f) ? 0.1f : 0.0f;
+        s += t.l_order != UINT32_MAX ? 0.05f : 0.0f;
+        a.s_scene = std::clamp(s, 0.0f, 0.8f);
     }
     // Material (metalness / specular / roughness): an 8-bit member of a many-target G-buffer that is neither albedo nor normals.
     // Which channel means what cannot be told from the contents: it is offered as a candidate, never assigned automatically.
@@ -526,6 +677,8 @@ static void analyse(PoolTex &t, const uint8_t *data, uint32_t row_pitch)
         a.s_material = 0.5f;
     if (a.s_hdr >= 0.6f)
         a.label = "HDR scene light (lighting before tonemapping)";
+    else if (a.s_scene >= 0.6f && a.s_albedo < 0.6f && a.s_normal < 0.6f)
+        a.label = "screen-format colour (maybe the finished frame)";
     else if (a.hdr_frac > 0.01f && a.channels >= 3)
         a.label = "lit colour / HDR (not albedo)";
     else if (a.s_normal >= 0.6f && a.s_normal >= a.s_albedo)
@@ -534,7 +687,7 @@ static void analyse(PoolTex &t, const uint8_t *data, uint32_t row_pitch)
     else if (a.s_albedo >= 0.6f)
         a.label = "albedo / base colour";
     else if (a.s_motion >= 0.6f)
-        a.label = "motion vectors";
+        a.label = a.channels == 4 ? "motion vectors (xy of four channels)" : "motion vectors";
     else if (a.s_material > 0.0f)
         a.label = "G-buffer member: maybe material (metalness / specular / roughness)";
     else if (a.channels == 1)
@@ -635,6 +788,7 @@ static void assign_texture_feed(int feed, const PoolTex &t)
     FeedConfig &f = g.feed[feed];
     f.source = SRC_TEXTURE;
     f.tex = t.sig;
+    set_relative_size(f.tex);                    // so a shared listing finds it again at another screen resolution
     f.enabled = true;
     if (feed == FEED_NORMALS && t.an.done && t.an.error.empty())
     {
@@ -648,111 +802,48 @@ static void assign_texture_feed(int feed, const PoolTex &t)
     g.dirty = true;
 }
 
-// Picks the best-scoring analysed textures. `replace`: every feed that has a clear winner is (re)assigned, also when it already had a
-// texture (the user asked again, or an assigned texture was lost after a loading screen). Without it only empty feeds are filled.
-// The material feed is never assigned automatically (the meaning of its channels cannot be told from the contents).
-static void auto_assign_from_analysis(bool replace)
+// The best-scoring analysed texture per feed, as suggestions for the Profiler tab (the user assigns; nothing is assigned here).
+struct Suggestion { bool have = false; float score = 0.0f; TexSig sig; format fmt = format::unknown; resource res = { 0 }; };
+
+static void profiler_suggestions(Suggestion out[FEED_COUNT])
 {
-    struct Best { float s = 0.0f; PoolTex t; bool have = false; } best[FEED_COUNT];
-    {
-        std::lock_guard<std::mutex> lock(prof.m);
-        for (const auto &e : prof.pool)
-        {
-            const PoolTex &t = e.second;
-            if (!t.an.done || !t.an.error.empty())
-                continue;
-            for (int i = 0; i < FEED_COUNT; i++)
-            {
-                const float sc = t.an.score(i);
-                const float need = i == FEED_MATERIAL ? 0.45f : 0.6f;
-                // ties: the texture drawn to most wins (the main target, not a copy)
-                if (sc >= need && (sc > best[i].s || (sc == best[i].s && best[i].have && t.l_draws > best[i].t.l_draws)))
-                {
-                    best[i].s = sc;
-                    best[i].t = t;
-                    best[i].have = true;
-                }
-            }
-        }
-    }
-    // One texture is never two feeds: the higher score keeps it.
-    for (int i = 0; i < FEED_COUNT; i++)
-        for (int j = i + 1; j < FEED_COUNT; j++)
-            if (best[i].have && best[j].have && best[i].t.res == best[j].t.res)
-            {
-                if (best[i].s >= best[j].s) best[j].have = false;
-                else best[i].have = false;
-            }
-    std::string report;
-    for (int i = 0; i < FEED_COUNT; i++)
-    {
-        bool has;
-        {
-            std::lock_guard<std::mutex> lock(g.mtx);
-            has = g.feed[i].source == SRC_TEXTURE && g.feed[i].tex.valid() && g.feed_res[i].handle != 0;
-        }
-        char b[200];
-        if (!best[i].have)
-        {
-            if (i != FEED_MATERIAL)
-                report += std::string(FEED_LABEL[i]) + ": no clear candidate.  ";
-            continue;
-        }
-        if (i == FEED_MATERIAL)
-        {
-            std::snprintf(b, sizeof(b), "Material: candidate %s %ux%u #%u (assign it in the Profiler and set its channel).  ", fmt_name(best[i].t.fmt),
-                          best[i].t.sig.w, best[i].t.sig.h, best[i].t.sig.ordinal);
-            report += b;
-            continue;
-        }
-        if (has && !replace)
-        {
-            report += std::string(FEED_LABEL[i]) + ": kept the current texture.  ";
-            continue;
-        }
-        assign_texture_feed(i, best[i].t);
-        std::snprintf(b, sizeof(b), "%s: %s %ux%u #%u (score %.2f).  ", FEED_LABEL[i], fmt_name(best[i].t.fmt), best[i].t.sig.w, best[i].t.sig.h,
-                      best[i].t.sig.ordinal, best[i].s);
-        report += b;
-    }
     std::lock_guard<std::mutex> lock(prof.m);
-    prof.last_auto = report;
-    log_msg(reshade::log::level::info, "Profiler auto-detect: " + report);
+    uint32_t best_draws[FEED_COUNT] = {};
+    for (const auto &e : prof.pool)
+    {
+        const PoolTex &t = e.second;
+        if (!t.an.done || !t.an.error.empty())
+            continue;
+        for (int i = 0; i < FEED_COUNT; i++)
+        {
+            const float sc = t.an.score(i);
+            const float need = i == FEED_MATERIAL ? 0.45f : 0.6f;
+            // ties: the texture drawn to most wins (the main target, not a copy)
+            if (sc >= need && (sc > out[i].score || (sc == out[i].score && out[i].have && t.l_draws > best_draws[i])))
+            {
+                out[i].have = true;
+                out[i].score = sc;
+                out[i].sig = t.sig;
+                out[i].fmt = t.fmt;
+                out[i].res = t.res;
+                best_draws[i] = t.l_draws;
+            }
+        }
+    }
 }
 
 static void pool_present(effect_runtime *rt)
 {
     pool_readback_step(rt);
-    bool do_assign = false, replace = false;
-    {
-        std::lock_guard<std::mutex> lock(prof.m);
-        if (prof.auto_assign_pending && prof.snapshot_phase == 0)
-        {
-            bool busy = false;
-            for (const auto &e : prof.pool)
-                if (e.second.rb_state == 1 || e.second.rb_state == 2)
-                    busy = true;
-            if (!busy)
-            {
-                prof.auto_assign_pending = false;
-                do_assign = true;
-                replace = prof.auto_replace;
-                prof.auto_replace = false;
-            }
-        }
-    }
-    if (do_assign)
-        auto_assign_from_analysis(replace);
+    rematch_feeds();
 }
 
-// auto_assign: assign the best candidates when the analysis is done; replace: also replace feeds that already have a texture.
-static void pool_request_snapshot(bool auto_assign, bool replace = false)
+// Snapshot, then analysis: the Profiler tab shows the scores. Nothing is assigned.
+static void pool_request_snapshot()
 {
     std::lock_guard<std::mutex> lock(prof.m);
     if (prof.snapshot_phase == 0)
         prof.snapshot_phase = 1;
-    prof.auto_assign_pending |= auto_assign;
-    prof.auto_replace |= replace;
 }
 
 static void pool_release_snapshots()

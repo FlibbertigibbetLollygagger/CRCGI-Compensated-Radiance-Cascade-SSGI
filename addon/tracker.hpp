@@ -149,10 +149,25 @@ static void on_push_constants(command_list *cl, shader_stage stages, pipeline_la
 
 static void on_push_descriptors(command_list *cl, shader_stage stages, pipeline_layout layout, uint32_t param, const descriptor_table_update &update)
 {
-    if (t_injecting || !tracking_wanted(cl))
+    if (t_injecting)
         return;
     CmdState *cs = cl->get_private_data<CmdState>();
     if (cs == nullptr)
+        return;
+    // Direct3D 10 / 11: CSSetUnorderedAccessViews arrives here with the views themselves. Remember which textures a dispatch will write.
+    if (update.type == descriptor_type::texture_unordered_access_view && update.descriptors != nullptr && !explicit_states(cl->get_device()))
+    {
+        const resource_view *views = static_cast<const resource_view *>(update.descriptors);
+        device *dev = cl->get_device();
+        for (uint32_t i = 0; i < update.count; i++)
+        {
+            const uint32_t slot = update.binding + i;
+            if (slot < 16)
+                cs->uav[slot] = views[i].handle != 0 ? dev->get_resource_from_view(views[i]) : resource{ 0 };
+        }
+        return;
+    }
+    if (!tracking_wanted(cl))
         return;
     RootSigState *sig = sig_for(cs->trk, stages);
     if (sig == nullptr)

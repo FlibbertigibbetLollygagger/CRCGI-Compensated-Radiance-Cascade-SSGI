@@ -2,7 +2,6 @@
 #pragma once
 #include "tracker.hpp"
 
-static bool explicit_states(device *d) { return d->get_api() == device_api::d3d12 || d->get_api() == device_api::vulkan; }
 
 // ---------------------------------------------------------------------------------------------------------------------
 // Techniques and uniforms of the runtime
@@ -241,7 +240,7 @@ static bool copy_into(command_list *cl, resource_usage src_state, FeedTex &t, co
     const bool msaa = sd.texture.samples > 1;
     // A resolve averages the samples. That is a valid reduction for colour (albedo, the preview), not for motion vectors or packed
     // normals: those feeds are reported as unsupported rather than silently fed with averaged data.
-    if (msaa && feed != FEED_ALBEDO && feed != FEED_HDR && feed != -1)
+    if (msaa && feed != FEED_ALBEDO && feed != FEED_HDR && feed != FEED_SCENE && feed != -1)
     {
         t.status = "multisampled target: not supported for this feed (a resolve would average vectors / packed values)";
         return false;
@@ -295,8 +294,27 @@ static ViewPair get_rtv_pair(device *dev, resource_view bound, resource res, con
     return vp;
 }
 
+// The colour view of a depth buffer's memory, by explicit mapping (the generic typeless -> typed lookup does not cover every depth-stencil
+// format): D16 -> R16 UNORM, D24S8 -> R24 UNORM X8, D32 -> R32 FLOAT, D32S8 -> R32 FLOAT X8 UINT. unknown = no colour view exists.
+static format depth_color_view(format f)
+{
+    switch (f)
+    {
+    case format::d16_unorm: case format::r16_typeless: case format::r16_unorm:
+        return format::r16_unorm;
+    case format::d24_unorm_s8_uint: case format::r24_g8_typeless: case format::r24_unorm_x8_uint:
+        return format::r24_unorm_x8_uint;
+    case format::d32_float: case format::r32_typeless: case format::r32_float:
+        return format::r32_float;
+    case format::d32_float_s8_uint: case format::r32_g8_typeless: case format::r32_float_x8_uint:
+        return format::r32_float_x8_uint;
+    default:
+        return format::unknown;
+    }
+}
+
 // A depth buffer can be sampled only if it is a single-sampled 2D texture created with shader-resource usage and a format family
-// that has a colour view (D32 -> R32F, D24S8 -> R24 UNORM X8, D16 -> R16 UNORM, D32S8 -> R32F X8). Unsupported cases are reported.
+// that has a colour view (see depth_color_view). Unsupported cases are reported.
 static DepthSrv get_depth_srv(device *dev, resource depth_res, DevState &ds)
 {
     std::lock_guard<std::mutex> lock(ds.view_mutex);
@@ -313,8 +331,10 @@ static DepthSrv get_depth_srv(device *dev, resource depth_res, DevState &ds)
         out.reason = "the game created the depth buffer without shader access: it cannot be sampled";
     else
     {
-        const format view_fmt = format_to_default_typed(format_to_typeless(dd.texture.format), 0);
-        if (view_fmt == format::unknown || view_fmt == format_to_typeless(dd.texture.format))
+        format view_fmt = depth_color_view(dd.texture.format);
+        if (view_fmt == format::unknown)
+            view_fmt = format_to_default_typed(format_to_typeless(dd.texture.format), 0);   // anything the table does not know
+        if (view_fmt == format::unknown || view_fmt == dd.texture.format)
             out.reason = std::string("no colour view for depth format ") + fmt_name(dd.texture.format);
         else if (!dev->create_resource_view(depth_res, resource_usage::shader_resource, resource_view_desc(view_fmt), &out.view))
         {
@@ -373,14 +393,14 @@ static void bind_feed(effect_runtime *rt, command_list *cl, DevState &ds, int i,
     {
         std::lock_guard<std::mutex> lock(ds.feed_mutex);
         FeedTex &ft = ds.feed[i];
-        bool ok = wanted && ft.srv.handle != 0 && ft.frame == g.frame;
+        bool ok = wanted && ft.srv.handle != 0 && ft.frame == g.frame;   // (every feed must be this frame's at an injection point)
         if (wanted && ok && ft.cl != reinterpret_cast<uintptr_t>(cl) && !cross_lists)
         {
             ok = false;
             ft.status = "captured on another command list: order not guaranteed (see Options)";
         }
         else if (wanted && !ok && ft.status.empty())
-            ft.status = ft.srv.handle == 0 ? "not captured yet" : "not captured this frame before the injection layer";
+            ft.status = ft.srv.handle == 0 ? "not captured yet" : "not captured this frame before the forced layer";
         if (ok)
         {
             v = feed_view(ft, i);
@@ -411,7 +431,9 @@ static void bind_feeds_end_of_frame(effect_runtime *rt)
         {
             std::lock_guard<std::mutex> lock(ds->feed_mutex);
             FeedTex &ft = ds->feed[i];
-            if (want[i] && ft.srv.handle != 0 && ft.frame != ~0ull && ft.frame + 3 >= g.frame)
+            // the finished frame must be this frame's (an old copy would show a stale picture); the G-buffer feeds may be a few frames old
+            const uint64_t max_age = i == FEED_SCENE ? 0 : 3;
+            if (want[i] && ft.srv.handle != 0 && ft.frame != ~0ull && ft.frame + max_age >= g.frame)
             {
                 v = feed_view(ft, i);
                 ft.bound_frame = g.frame;
@@ -589,7 +611,7 @@ static void suppress_end_of_frame(effect_runtime *rt)
         std::lock_guard<std::mutex> lock(g.mtx);
         if (!g.suppressed.empty())
             return;
-        const bool active = g.master && g.level >= LEVEL_B && g.role_ref[ROLE_INJECT].valid() && api_supports_injection(g.api) && g_conflict.empty();
+        const bool active = g.master && g.level >= LEVEL_B && g.force_inject && g.role_ref[ROLE_INJECT].valid() && api_supports_injection(g.api) && g_conflict.empty();
         const bool injected = g.injected_frame == g.frame;
         if (!active || (!injected && g.fallback_end))
             return;                                 // render at the end of the frame as usual (exactly once)
