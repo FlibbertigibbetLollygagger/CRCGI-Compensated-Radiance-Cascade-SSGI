@@ -522,14 +522,20 @@ static void draw_feeds(effect_runtime *rt)
         if (f.source == SRC_TEXTURE)
             ImGui::TextColored(f.tex.valid() ? (live.handle ? COL_OK : COL_WARN) : COL_DIM, "from %s%s", tex_text(f.tex).c_str(),
                                f.tex.valid() && live.handle == 0 ? " (not created by the game right now)" : "");
+        else if (f.layout != 0 && !f.ref.valid() && feed_policy(i) == CAP_RUN)
+            ImGui::TextColored(COL_OK, "from a shared listing: target %d of a layer layout (found when the game draws it)", f.ref.slot + 1);
         else
             ImGui::TextColored(f.ref.valid() ? COL_OK : COL_DIM, "from layer %s", layer_text(f.ref).c_str());
+        if (f.source == SRC_LAYER && f.layout != 0 && feed_policy(i) == CAP_RUN)
+            dim_wrapped("Follows the layer's layout (its targets' formats and sizes, not the texture's address): every pass drawn with that "
+                        "layout into this target is captured once it is complete, also when the game swaps or recreates the texture.");
         if (f.assigned())
         {
             ImGui::SameLine();
             if (ImGui::SmallButton("Clear"))
             {
                 f.ref = LayerRef();
+                f.layout = 0;
                 f.tex = TexSig();
                 f.enabled = false;
                 changed = true;
@@ -1244,17 +1250,15 @@ static void draw_options(effect_runtime *rt)
             "chosen, switch this off. Layers drawn inside a render pass, or whose state cannot be fully recorded, are refused with the reason.");
         draw_techniques(rt);
     }
-    if (ImGui::CollapsingHeader("Performance and asynchronous compute"))
+    if (ImGui::CollapsingHeader("Performance"))
     {
         dim_wrapped("What the add-on does for performance: it hands the shader the game's normals, albedo and motion vectors, which "
                     "removes the normal rebuild, the reflectance estimate and the motion estimation (G-Buffer tab, 'Shader work "
-                    "saved'). In the shader, Far Cascades: Half-Rate Update halves the cost of the long cascades.\n"
-                    "Asynchronous compute is not possible from a ReShade add-on: ReShade renders every pass of an effect on one "
-                    "graphics command list (render_technique), its API cannot create a compute queue, and a pass cannot be moved "
-                    "to another queue.");
+                    "saved'). In the shader, Shadow Contact Bias 0 skips the contact passes, and Far Cascades: "
+                    "Half-Rate Update halves the cost of the long cascades.");
     }
     if (ImGui::CollapsingHeader("Build"))
-        dim_wrapped("CRCGI Injector v1.2, built against ReShade revision %s (ImGui %s), %s.", CRCGI_RESHADE_REVISION, IMGUI_VERSION,
+        dim_wrapped("CRCGI Injector " CRCGI_ADDON_VERSION ", built against ReShade revision %s (ImGui %s), %s.", CRCGI_RESHADE_REVISION, IMGUI_VERSION,
                     sizeof(void *) == 8 ? "64-bit" : "32-bit");
 }
 

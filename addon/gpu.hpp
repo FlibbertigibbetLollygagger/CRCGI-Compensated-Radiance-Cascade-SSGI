@@ -40,12 +40,22 @@ static void refresh_techniques(effect_runtime *rt)
     std::lock_guard<std::mutex> lock(g.mtx);
     g.techs = std::move(list);
     g.suppressed.clear();                       // handles are invalid after a reload (the runtime re-creates the techniques)
-    if (g.techniques.empty())   // first run: pick the CRCGI technique(s) automatically
+    // First run, or none of the saved techniques is loaded any more (the shader was updated: the saved key names the old file and
+    // technique): pick the CRCGI technique(s) automatically. A saved list that still names a loaded technique is kept as it is.
+    bool present = false;
+    for (const TechInfo &t : g.techs)
+        present |= contains(g.techniques, t.key);
+    if (!present)
     {
+        std::vector<std::string> picked;
         for (const TechInfo &t : g.techs)
             if (lower(t.key).find("crcgi") != std::string::npos)
-                g.techniques.push_back(t.key);
-        g.dirty = true;
+                picked.push_back(t.key);
+        if (!picked.empty() || g.techniques.empty())
+        {
+            g.techniques = std::move(picked);
+            g.dirty = true;
+        }
     }
 }
 
@@ -387,7 +397,7 @@ static void set_semantic(effect_runtime *rt, int i, resource_view v)
 
 // Injection point: a feed is used only if it was captured THIS frame, before this point, on this command list (or the user accepted
 // feeds from other lists, whose order relative to this one is not guaranteed).
-static void bind_feed(effect_runtime *rt, command_list *cl, DevState &ds, int i, bool wanted, bool cross_lists)
+static bool bind_feed(effect_runtime *rt, command_list *cl, DevState &ds, int i, bool wanted, bool cross_lists)
 {
     resource_view v = { 0 };
     {
@@ -408,11 +418,52 @@ static void bind_feed(effect_runtime *rt, command_list *cl, DevState &ds, int i,
         }
     }
     set_semantic(rt, i, v);
+    return v.handle != 0;
+}
+
+// The shader switches the add-on drives ('Drive the shader's switch'), set right where the textures are bound, so a switch is never on
+// while its texture is unbound. A switch that is off comes on after 3 frames in a row with the feed delivered, and goes off in the
+// first frame without it: a feed that comes and goes cannot make the picture flicker between game data and the shader's own.
+static void drive_switches(effect_runtime *rt, const bool delivered[FEED_COUNT])
+{
+    bool sync[FEED_COUNT], on[FEED_COUNT];
+    {
+        std::lock_guard<std::mutex> lock(g.mtx);
+        const uint64_t frame = g.frame;
+        for (int i = 0; i < FEED_COUNT; i++)
+        {
+            sync[i] = g.feed[i].sync;
+            if (!delivered[i])
+                g.feed_streak[i] = 0;
+            else if (g.feed_streak_frame[i] != frame)
+                g.feed_streak[i]++;
+            g.feed_streak_frame[i] = frame;
+            g.feed_on[i] = delivered[i] && (g.feed_on[i] || g.feed_streak[i] >= 3);
+            on[i] = g.feed_on[i];
+        }
+    }
+    for (int i = 0; i < FEED_COUNT; i++)
+        if (sync[i])
+            set_uniform(rt, FEED_SWITCH[i], on[i] ? 1 : 0, 0);
 }
 
 // End of the frame (every API, also without in-frame injection): the latest capture is used if it is recent (a feed whose layer or
 // texture stopped being drawn, e.g. in menus, is unbound after a few frames). GPU order: the game's command lists that hold the
 // copies are submitted before the present, so the end-of-frame render sees the copy of this frame.
+// How old a capture may be: the finished frame none (a stale picture), motion vectors one frame (they describe one frame's motion),
+// normals and the HDR scene light 3, albedo and material 8 (surface properties: a short gap in the capture is bridged instead of
+// switching the game data off and on).
+static uint64_t feed_max_age(int i)
+{
+    switch (i)
+    {
+    case FEED_SCENE: return 0;
+    case FEED_MOTION: return 1;
+    case FEED_ALBEDO: case FEED_MATERIAL: return 8;
+    default: return 3;
+    }
+}
+
 static void bind_feeds_end_of_frame(effect_runtime *rt)
 {
     DevState *ds = rt->get_device()->get_private_data<DevState>();
@@ -425,14 +476,14 @@ static void bind_feeds_end_of_frame(effect_runtime *rt)
             want[i] = g.master && g.level >= LEVEL_C && api_supports_feeds(g.api) && g.feed[i].enabled && g.feed[i].assigned();
     }
     bool any = false;
+    bool delivered[FEED_COUNT] = {};
     for (int i = 0; i < FEED_COUNT; i++)
     {
         resource_view v = { 0 };
         {
             std::lock_guard<std::mutex> lock(ds->feed_mutex);
             FeedTex &ft = ds->feed[i];
-            // the finished frame must be this frame's (an old copy would show a stale picture); the G-buffer feeds may be a few frames old
-            const uint64_t max_age = i == FEED_SCENE ? 0 : 3;
+            const uint64_t max_age = feed_max_age(i);
             if (want[i] && ft.srv.handle != 0 && ft.frame != ~0ull && ft.frame + max_age >= g.frame)
             {
                 v = feed_view(ft, i);
@@ -443,7 +494,9 @@ static void bind_feeds_end_of_frame(effect_runtime *rt)
                 ft.status = ft.srv.handle == 0 ? "not captured yet: the assigned layer / texture was not drawn" : "not captured in the last frames";
         }
         set_semantic(rt, i, v);
+        delivered[i] = v.handle != 0;
     }
+    drive_switches(rt, delivered);
     if (any)
     {
         std::lock_guard<std::mutex> lock(g.mtx);
@@ -535,8 +588,10 @@ static bool inject(command_list *cl, CmdState &cs)
         return false;                               // ReShade is rendering the end of the previous frame right now (D3D12): skip once
 
     // Level C: hand the captured G-buffer feeds to the shader (or clear the binding when a feed is off or not usable)
+    bool delivered[FEED_COUNT] = {};
     for (int i = 0; i < FEED_COUNT; i++)
-        bind_feed(rt, cl, *ds, i, feed_on[i], cross_lists);
+        delivered[i] = bind_feed(rt, cl, *ds, i, feed_on[i], cross_lists);
+    drive_switches(rt, delivered);
 
     // Depth: the depth buffer in use at this point of the frame
     resource depth_res = { 0 };
@@ -698,9 +753,7 @@ static void apply_shader_link(effect_runtime *rt)
         set_uniform(rt, "Integration_Reversed", cam.reversed ? 1 : 0, 0);
     }
 
-    for (int i = 0; i < FEED_COUNT; i++)
-        if (feeds[i].sync)
-            set_uniform(rt, FEED_SWITCH[i], (level >= LEVEL_C && feeds[i].enabled && feed_ready(i)) ? 1 : 0, 0);
+    // The feed switches themselves are set where the textures are bound (drive_switches).
     if (level >= LEVEL_C)
     {
         if (feeds[FEED_NORMALS].sync)

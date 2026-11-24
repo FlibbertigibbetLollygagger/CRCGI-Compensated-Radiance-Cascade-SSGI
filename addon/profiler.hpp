@@ -58,8 +58,10 @@ struct PoolTex
     bool cur_depth = false;
     uint32_t l_binds = 0, l_draws = 0, l_mrt = 0, l_slot = 8, l_order = UINT32_MAX;
     bool l_depth = false;
-    // The binding interval that drew most to this texture (its "main" interval): captures of a feed taken from the texture happen
-    // only there, because engines reuse transient texture memory later in the frame for unrelated passes.
+    // The target layout of the binding interval that drew most to this texture (its "main" layout): captures of a feed taken from the
+    // texture happen only at write runs with that layout, because engines reuse transient texture memory later in the frame for
+    // unrelated passes. A layout, not a single interval: it does not change when the camera changes what is drawn first or how the
+    // game splits the pass into intervals.
     uint64_t cur_main_key = 0, l_main_key = 0;
     uint32_t cur_main_draws = 0, l_main_draws = 0;
     bool cur_main_seen = false;          // the interval that was main so far occurred again in the frame being recorded
@@ -107,8 +109,8 @@ static bool pool_candidate_size(const PoolTex &t, int filter)
     return true;
 }
 
-// True when `key` is the binding interval that drew most to the texture in the last frame. Unknown (no frame seen yet) = false, so a
-// feed is never captured from an interval that may be unrelated reuse of the same memory.
+// True when `key` is the main layout of the texture (the layout of the binding that drew most to it, see pool_end_frame). Unknown (no
+// frame seen yet) = false, so a feed is never captured from an interval that may be unrelated reuse of the same memory.
 static bool pool_is_main_interval(resource res, uint64_t key)
 {
     std::lock_guard<std::mutex> lock(prof.m);
@@ -297,12 +299,12 @@ static void pool_note_interval(const CmdState &cs, uint32_t order)
         PoolTex &t = it->second;
         t.cur_binds++;
         t.cur_draws += cs.draws;
-        if (cs.pass_key == t.l_main_key)
+        if (cs.layout == t.l_main_key)
             t.cur_main_seen = true;
         if (cs.draws > t.cur_main_draws)
         {
             t.cur_main_draws = cs.draws;
-            t.cur_main_key = cs.pass_key;
+            t.cur_main_key = cs.layout;
         }
         t.cur_mrt = std::max(t.cur_mrt, cs.rt_count);
         t.cur_slot = std::min(t.cur_slot, s);

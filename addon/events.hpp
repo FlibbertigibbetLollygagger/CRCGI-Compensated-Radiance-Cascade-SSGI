@@ -3,6 +3,11 @@
 // How the game is watched (the same set of events ReShade Effect Shader Toggler hooks): every draw, indexed draw, indirect draw and
 // compute dispatch counts as work of the current render-target binding interval, pipeline binds give the shader identities, and render
 // pass / clear / barrier events delimit intervals on the explicit APIs.
+//
+// What identifies game data from frame to frame is the STRUCTURE of the frame, never a memory address and never what happens to be drawn
+// first: a layer's target layout (how many targets, their formats, their size relative to the screen, depth bound or not) does not
+// change when the camera turns, when the game recreates or swaps its textures, or between players at different resolutions. Feeds are
+// captured at the end of a write run (see FeedRun), so a G-buffer drawn in several intervals is captured complete.
 #pragma once
 #include "camera.hpp"
 #include "profiler.hpp"
@@ -157,7 +162,7 @@ static int role_of(const Pass &p, int slot)
     me.key = p.key;
     me.slot = slot;
     for (int i = 0; i < FEED_COUNT; i++)
-        if (g.feed[i].source == SRC_LAYER && g.feed[i].ref == me)
+        if (g.feed[i].source == SRC_LAYER && (g.feed[i].ref == me || (g.feed[i].layer_match(i, p.key, p.layout) && g.feed[i].ref.slot == slot)))
             return ROLE_NORMALS + i;
     if (slot == 0 && g.role_ref[ROLE_INJECT].key == p.key) return ROLE_INJECT;
     if (slot == 0 && g.role_ref[ROLE_DEPTH].key == p.key) return ROLE_DEPTH;
@@ -172,7 +177,12 @@ static void apply_role(const Pass &p, int slot, int role)
     me.slot = slot;
     // a row holds one role: free whatever it held
     for (int i = 0; i < FEED_COUNT; i++)
-        if (g.feed[i].source == SRC_LAYER && g.feed[i].ref == me) { g.feed[i].ref = LayerRef(); g.feed[i].enabled = false; }
+        if (g.feed[i].source == SRC_LAYER && (g.feed[i].ref == me || (g.feed[i].layer_match(i, p.key, p.layout) && g.feed[i].ref.slot == slot)))
+        {
+            g.feed[i].ref = LayerRef();
+            g.feed[i].layout = 0;
+            g.feed[i].enabled = false;
+        }
     if (slot == 0)
     {
         if (g.role_ref[ROLE_INJECT].key == p.key) g.role_ref[ROLE_INJECT] = LayerRef();
@@ -185,6 +195,7 @@ static void apply_role(const Pass &p, int slot, int role)
         FeedConfig &f = g.feed[role - ROLE_NORMALS];
         f.source = SRC_LAYER;
         f.ref = me;
+        f.layout = p.layout;
         f.enabled = true;
         if (g.level < LEVEL_C)
             g.level = LEVEL_C;
@@ -229,19 +240,25 @@ static std::string hint_for(const Pass &p, int slot)
 // ---------------------------------------------------------------------------------------------------------------------
 // Passes
 // ---------------------------------------------------------------------------------------------------------------------
-static void capture_feed(command_list *cl, DevState &ds, int feed, resource_usage state, const RtSlot &src, uint64_t key, bool barrier_path)
+// draws: the draws of the write run that ends here (0 = unknown, the Vulkan barrier path).
+static void capture_feed(command_list *cl, DevState &ds, int feed, resource_usage state, const RtSlot &src, uint32_t draws, bool barrier_path)
 {
     std::lock_guard<std::mutex> lock(ds.feed_mutex);
     FeedTex &ft = ds.feed[feed];
-    // One binding per frame feeds a texture: engines reuse transient memory later in the frame for unrelated passes, and a copy of
-    // those would overwrite the G-buffer copy (the picture then flashes). Only a later capture at the SAME binding may replace it.
-    if (ft.frame == g.frame && ft.cap_key != 0 && ft.cap_key != key)
-        return;
-    if (barrier_path && ft.frame == g.frame)
+    // A later run in the same frame replaces the copy only if it continues it (the same texture, not cleared since: it holds everything
+    // the earlier run drew and more) or draws more than everything captured so far (the main use of the layout, not a smaller pass
+    // that happens to use the same kind of targets). Engines reuse transient memory later in the frame for unrelated passes; those
+    // runs neither continue the copy nor outdraw it, so they never overwrite the G-buffer copy (the picture would flash).
+    const int policy = barrier_path ? CAP_FIRST : feed_policy(feed);
+    const bool same_frame = ft.frame == g.frame;
+    const bool continues = policy == CAP_RUN && same_frame && ft.cap_res == src.res && !ft.tainted;
+    if (same_frame && (policy == CAP_FIRST || (!continues && draws <= ft.cap_draws)))
         return;
     if (copy_into(cl, state, ft, src, feed))
     {
-        ft.cap_key = key;
+        ft.cap_draws = continues ? ft.cap_draws + draws : draws;
+        ft.cap_res = src.res;
+        ft.tainted = false;
         std::lock_guard<std::mutex> l2(g.mtx);
         if (barrier_path) g.n_captures_barrier++;
         else g.n_captures_interval++;
@@ -250,7 +267,7 @@ static void capture_feed(command_list *cl, DevState &ds, int feed, resource_usag
 
 // Takes the captures of one finished binding interval: profiler snapshots, feeds taken from the interval's layer or texture, and the
 // preview. The command list must be outside a render pass.
-static void run_captures(command_list *cl, CmdState &cs, uint64_t key, uint32_t rt_count, const RtSlot *rt, const std::vector<CaptureTodo> &todo,
+static void run_captures(command_list *cl, CmdState &cs, uint32_t draws, uint32_t rt_count, const RtSlot *rt, const std::vector<CaptureTodo> &todo,
                          bool prev, int prev_slot, bool snapshots)
 {
     if (snapshots)
@@ -264,7 +281,7 @@ static void run_captures(command_list *cl, CmdState &cs, uint64_t key, uint32_t 
         return;
     for (const CaptureTodo &t : todo)
         if (t.slot >= 0 && t.slot < 8 && rt[t.slot].res.handle != 0)
-            capture_feed(cl, *ds, t.feed, bound_rt_state(cs, rt[t.slot].res), rt[t.slot], key, false);
+            capture_feed(cl, *ds, t.feed, bound_rt_state(cs, rt[t.slot].res), rt[t.slot], draws, false);
     if (prev && prev_slot >= 0 && prev_slot < static_cast<int>(rt_count) && rt[prev_slot].res.handle != 0)
     {
         std::lock_guard<std::mutex> lock(ds->feed_mutex);
@@ -282,7 +299,109 @@ static void flush_pending(command_list *cl, CmdState &cs)
     list.swap(cs.pending);
     for (const PendingCapture &pc : list)
         if (pc.frame == g.frame)
-            run_captures(cl, cs, pc.key, pc.rt_count, pc.rt, pc.todo, pc.prev, pc.prev_slot, pc.snapshots);
+            run_captures(cl, cs, pc.draws, pc.rt_count, pc.rt, pc.todo, pc.prev, pc.prev_slot, pc.snapshots);
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Feed write runs (see FeedRun)
+// ---------------------------------------------------------------------------------------------------------------------
+// The layout of a set of targets: count, per target its format, its size in 64ths of the screen and its sample count, and whether a
+// depth buffer is bound. No memory addresses and no shaders, so it is the same in every frame, after the game recreates its targets,
+// whichever texture of a pair is bound this frame, and at another screen resolution.
+static uint64_t layout_of(const RtSlot *rt, uint32_t count, bool depth)
+{
+    struct L { uint32_t count, depth; uint32_t fmt[8], rw[8], rh[8], samples[8]; } l;
+    std::memset(&l, 0, sizeof(l));
+    l.count = std::min<uint32_t>(count, 8);
+    l.depth = depth ? 1u : 0u;
+    const uint32_t bw = g.bb_w, bh = g.bb_h;
+    for (uint32_t i = 0; i < l.count; i++)
+    {
+        if (rt[i].res.handle == 0)
+            continue;
+        l.fmt[i] = static_cast<uint32_t>(rt[i].fmt);
+        l.rw[i] = bw != 0 ? static_cast<uint32_t>((static_cast<uint64_t>(rt[i].w) * 64 + bw / 2) / bw) : rt[i].w;
+        l.rh[i] = bh != 0 ? static_cast<uint32_t>((static_cast<uint64_t>(rt[i].h) * 64 + bh / 2) / bh) : rt[i].h;
+        l.samples[i] = rt[i].samples;
+    }
+    const uint64_t h = fnv64(&l, sizeof(l));
+    return h != 0 ? h : 1;
+}
+
+// Ends feed i's run on this command list: the texture now holds everything the run drew, copy it (inside a Direct3D 12 render pass:
+// right after the pass, see PendingCapture).
+static void run_end(command_list *cl, CmdState &cs, int i)
+{
+    FeedRun r = cs.run[i];
+    cs.run[i].open = false;
+    if (!r.open || r.frame != g.frame || r.src.res.handle == 0)
+        return;
+    if (cs.in_render_pass)
+    {
+        if (cl->get_device()->get_api() != device_api::d3d12)
+            return;
+        PendingCapture pc;
+        pc.frame = g.frame;
+        pc.rt_count = 1;
+        pc.rt[0] = r.src;
+        pc.todo.push_back({ i, 0 });
+        pc.draws = r.draws;
+        cs.pending.push_back(std::move(pc));
+        if (cs.pending.size() > 64)
+            cs.pending.erase(cs.pending.begin());
+        return;
+    }
+    DevState *ds = cl->get_device()->get_private_data<DevState>();
+    if (ds == nullptr)
+        return;
+    capture_feed(cl, *ds, i, bound_rt_state(cs, r.src.res), r.src, r.draws, false);
+}
+
+static void end_all_runs(command_list *cl, CmdState &cs)
+{
+    for (int i = 0; i < FEED_COUNT; i++)
+        if (cs.run[i].open)
+            run_end(cl, cs, i);
+}
+
+// Ends the runs that write `res` (it is about to be cleared, copied or transitioned).
+static void end_runs_of(command_list *cl, CmdState &cs, resource res)
+{
+    for (int i = 0; i < FEED_COUNT; i++)
+        if (cs.run[i].open && cs.run[i].src.res == res)
+            run_end(cl, cs, i);
+}
+
+// A finished binding interval that drew into feed i's texture: it extends the open run (same texture, same layout) or starts a new one.
+static void run_extend(command_list *cl, CmdState &cs, int i, int slot, uint32_t draws)
+{
+    FeedRun &r = cs.run[i];
+    const RtSlot &src = cs.rt[slot];
+    if (r.open && r.frame == g.frame && r.src.res == src.res && r.layout == cs.layout && r.slot == slot)
+    {
+        r.draws += draws;
+        return;
+    }
+    if (r.open)
+        run_end(cl, cs, i);
+    r.open = true;
+    r.frame = g.frame;
+    r.layout = cs.layout;
+    r.slot = slot;
+    r.src = src;
+    r.draws = std::max<uint32_t>(draws, 1);
+}
+
+// A clear of a texture starts a new use of its memory: a capture of it taken earlier in the frame is not continued by a later run.
+static void taint_feeds(device *dev, resource res)
+{
+    DevState *ds = dev->get_private_data<DevState>();
+    if (ds == nullptr)
+        return;
+    std::lock_guard<std::mutex> lock(ds->feed_mutex);
+    for (int i = 0; i < FEED_COUNT; i++)
+        if (ds->feed[i].frame == g.frame && ds->feed[i].cap_res == res)
+            ds->feed[i].tainted = true;
 }
 
 static void end_pass(command_list *cl, CmdState &cs)
@@ -313,7 +432,8 @@ static void end_pass(command_list *cl, CmdState &cs)
                 const FeedConfig &f = g.feed[i];
                 if (!f.enabled)
                     continue;
-                if (f.source == SRC_LAYER && f.ref.key == cs.pass_key && f.ref.slot >= 0 && f.ref.slot < static_cast<int>(cs.rt_count))
+                if (f.source == SRC_LAYER && f.layer_match(i, cs.pass_key, cs.layout) && f.ref.slot >= 0 && f.ref.slot < static_cast<int>(cs.rt_count) &&
+                    cs.rt[f.ref.slot].res.handle != 0)
                     todo.push_back({ i, f.ref.slot });
                 else if (f.source == SRC_TEXTURE && g.feed_res[i].handle != 0)
                     for (uint32_t s = 0; s < cs.rt_count && s < 8; s++)
@@ -326,14 +446,23 @@ static void end_pass(command_list *cl, CmdState &cs)
             prev_slot = g.preview_slot;
         }
     }
-    // A texture feed is captured only at the texture's main binding (the one that drew most to it): later bindings of the same memory
-    // belong to unrelated passes. (Checked outside g.mtx: the profiler has its own lock.)
+    // A texture feed is captured only at runs with the texture's main layout (that of the binding that drew most to it): later bindings
+    // of the same memory in another role belong to unrelated passes. (Checked outside g.mtx: the profiler has its own lock.)
     for (const CaptureTodo &c : candidates)
-        if (pool_is_main_interval(cs.rt[c.slot].res, cs.pass_key))
+        if (pool_is_main_interval(cs.rt[c.slot].res, cs.layout))
             todo.push_back(c);
     pool_note_interval(cs, order);
+    // G-buffer feeds: the interval joins its write run, the copy is made when the run ends (run_end). The others are copied now.
+    std::vector<CaptureTodo> now;
+    for (const CaptureTodo &c : todo)
+    {
+        if (feed_policy(c.feed) == CAP_RUN)
+            run_extend(cl, cs, c.feed, c.slot, cs.draws);
+        else
+            now.push_back(c);
+    }
     if (copy_now)
-        run_captures(cl, cs, cs.pass_key, cs.rt_count, cs.rt, todo, prev, prev_slot, true);
+        run_captures(cl, cs, cs.draws, cs.rt_count, cs.rt, now, prev, prev_slot, true);
     else if (copy_later)
     {
         PendingCapture pc;
@@ -342,7 +471,8 @@ static void end_pass(command_list *cl, CmdState &cs)
         pc.rt_count = std::min<uint32_t>(cs.rt_count, 8);
         for (uint32_t i = 0; i < 8; i++)
             pc.rt[i] = cs.rt[i];
-        pc.todo = todo;
+        pc.todo = now;
+        pc.draws = cs.draws;
         pc.prev = prev;
         pc.prev_slot = prev_slot;
         pc.snapshots = true;
@@ -393,11 +523,12 @@ static void begin_pass(command_list *cl, CmdState &cs)
     cs.blend_draws = 0;
     cs.zwrite_draws = 0;
 
-    // Layer key: shaders + targets (format, size and the texture's run-to-run identity) + the occurrence of that signature in THIS
-    // recording. Independent of how command lists interleave on other threads, and of the back buffer index.
-    struct KeyData { uint32_t ps, vs, count, depth; uint32_t fmt[8], w[8], h[8]; uint64_t id[8]; } kd;
+    // Layer key: targets (format, size and the texture's run-to-run identity) + the occurrence of that signature in THIS recording.
+    // Independent of how command lists interleave on other threads, and of the back buffer index. The shaders are NOT part of it: the
+    // first draw of a G-buffer or lighting pass depends on what the camera sees, and the layer would get a new key whenever it changes.
+    struct KeyData { uint32_t count, depth; uint32_t fmt[8], w[8], h[8]; uint64_t id[8]; } kd;
     std::memset(&kd, 0, sizeof(kd));
-    kd.ps = cs.ps; kd.vs = cs.vs; kd.count = p.rt_count; kd.depth = cs.dsv.handle != 0;
+    kd.count = p.rt_count; kd.depth = cs.dsv.handle != 0;
     for (int i = 0; i < 8; i++)
     {
         kd.fmt[i] = static_cast<uint32_t>(cs.rt[i].fmt);
@@ -406,6 +537,16 @@ static void begin_pass(command_list *cl, CmdState &cs)
         kd.id[i] = cs.rt[i].res.handle != 0 ? pool_identity(cs.rt[i].res) : 0;
     }
     const uint64_t base = fnv64(&kd, sizeof(kd));
+    cs.layout = layout_of(cs.rt, p.rt_count, cs.dsv.handle != 0);
+    p.layout = cs.layout;
+    // A run ends where its texture is drawn to in another layout or another texture takes its slot (the draw that opens this interval
+    // has not run yet: the copy holds exactly what the run drew).
+    for (int i = 0; i < FEED_COUNT; i++)
+    {
+        const FeedRun &r = cs.run[i];
+        if (r.open && (r.layout != cs.layout || cs.rt[r.slot].res != r.src.res))
+            run_end(cl, cs, i);
+    }
     if (cs.occ_frame != g.frame)
     {
         cs.occ.clear();                          // the occurrence counter restarts every frame on every API (a list that is reused across
@@ -464,6 +605,8 @@ static void sync_frame(CmdState &cs)
         cs.dispatches = 0;
         cs.occ.clear();                          // layer keys count occurrences within one frame's recording
         cs.occ_frame = frame;
+        for (FeedRun &r : cs.run)
+            r.open = false;
     }
 }
 
@@ -497,6 +640,7 @@ static void on_dispatch_common(command_list *cl)
         return;
     sync_frame(*cs);
     flush_pending(cl, *cs);
+    end_all_runs(cl, *cs);                       // a compute pass reads (or writes) what the runs drew: they are complete
     cs->dispatches++;
     device *dev = cl->get_device();
     if (explicit_states(dev))
@@ -542,6 +686,7 @@ static void on_dispatch_common(command_list *cl)
             pc.rt[0].fmt = d.texture.format;
             pc.rt[0].view_fmt = d.texture.format;
             pc.todo.push_back({ i, 0 });
+            pc.draws = 1;
             cs->pending.push_back(std::move(pc));
             if (cs->pending.size() > 64)
                 cs->pending.erase(cs->pending.begin());
@@ -628,6 +773,30 @@ static void on_reset_cmd_list(command_list *cl)
         cs->pending.clear();
         for (resource &r : cs->uav)
             r = resource{ 0 };
+        for (FeedRun &r : cs->run)
+            r.open = false;
+    }
+}
+
+// Before a command list is closed (Direct3D 12 Close, Direct3D 11 FinishCommandList, Vulkan vkEndCommandBuffer): the last binding
+// interval of the list ends here, and with it any open feed run. Engines often close a list right after the G-buffer pass; without this
+// the last interval of such a list would never be captured.
+static void on_close_cmd_list(command_list *cl)
+{
+    if (t_injecting)
+        return;
+    CmdState *cs = cl->get_private_data<CmdState>();
+    if (cs == nullptr || cs->frame != g.frame)
+        return;
+    if (cl->get_device()->get_api() == device_api::vulkan)
+        return;                                   // Vulkan captures at barriers only (end_pass records, copies nothing there)
+    if (cs->pass_open)
+        end_pass(cl, *cs);
+    cs->pass_open = false;
+    if (!cs->in_render_pass)
+    {
+        end_all_runs(cl, *cs);
+        flush_pending(cl, *cs);
     }
 }
 
@@ -645,6 +814,10 @@ static void on_barrier(command_list *cl, uint32_t count, const resource *resourc
         return;
     sync_frame(*cs);
     flush_pending(cl, *cs);                       // before the new states are recorded: the resources are still where they were
+    if (!cs->in_render_pass)
+        for (uint32_t i = 0; i < count; i++)
+            if (resources[i].handle != 0)
+                end_runs_of(cl, *cs, resources[i]);   // the game moves the texture on: its run is complete
     for (uint32_t i = 0; i < count; i++)
         if (resources[i].handle != 0)
             cs->states[resources[i].handle] = new_states[i];
@@ -695,17 +868,13 @@ static void on_barrier(command_list *cl, uint32_t count, const resource *resourc
         src.h = d.texture.height;
         src.samples = d.texture.samples;
         src.fmt = d.texture.format;
-        uint64_t key = 0;
         {
             std::lock_guard<std::mutex> lock(prof.m);
             auto it = prof.pool.find(res.handle);
             if (it != prof.pool.end())
-            {
                 src.view_fmt = it->second.view_fmt;
-                key = it->second.l_main_key;
-            }
         }
-        capture_feed(cl, *ds, f, new_states[feed_hit[f]], src, key, true);
+        capture_feed(cl, *ds, f, new_states[feed_hit[f]], src, 0, true);
     }
 }
 
@@ -827,6 +996,23 @@ static void set_bindings(command_list *cl, CmdState &cs, uint32_t count, const r
     for (uint32_t i = 0; i < 8; i++)
         cs.rtv[i] = (i < cs.rt_count && rtvs != nullptr) ? rtvs[i] : resource_view{ 0 };
     cs.dsv_view = dsv;
+    // An open run continues only while its texture stays bound in its slot (rebinding the same G-buffer between draws is common); the
+    // layout is checked at the next draw (begin_pass).
+    bool any_open = false;
+    for (const FeedRun &r : cs.run)
+        any_open |= r.open;
+    if (!any_open)
+        return;
+    device *dev = cl->get_device();
+    for (int i = 0; i < FEED_COUNT; i++)
+    {
+        const FeedRun &r = cs.run[i];
+        if (!r.open)
+            continue;
+        const resource now = (static_cast<uint32_t>(r.slot) < cs.rt_count && cs.rtv[r.slot].handle != 0) ? dev->get_resource_from_view(cs.rtv[r.slot]) : resource{ 0 };
+        if (now != r.src.res)
+            run_end(cl, cs, i);
+    }
 }
 
 static void on_bind_render_targets(command_list *cl, uint32_t count, const resource_view *rtvs, resource_view dsv)
@@ -924,14 +1110,24 @@ static bool on_clear_render_target_view(command_list *cl, resource_view rtv, con
         return false;
     sync_frame(*cs);
     flush_pending(cl, *cs);
-    if (!cs->pass_open || cs->in_render_pass)
-        return false;
-    for (uint32_t i = 0; i < cs->rt_count && i < 8; i++)
-        if (cs->rtv[i] == rtv)
+    if (cs->pass_open && !cs->in_render_pass)
+        for (uint32_t i = 0; i < cs->rt_count && i < 8; i++)
+            if (cs->rtv[i] == rtv)
+            {
+                end_pass(cl, *cs);                        // pass_open becomes false: the next draw opens a new interval
+                break;
+            }
+    if (rtv.handle != 0)
+    {
+        device *dev = cl->get_device();
+        const resource res = dev->get_resource_from_view(rtv);
+        if (res.handle != 0)
         {
-            end_pass(cl, *cs);                        // pass_open becomes false: the next draw opens a new interval
-            break;
+            if (!cs->in_render_pass)
+                end_runs_of(cl, *cs, res);              // its run is complete: copied before the clear runs
+            taint_feeds(dev, res);                      // and a later run on it is a new use, not a continuation
         }
+    }
     return false;
 }
 
@@ -1007,8 +1203,13 @@ static void end_frame(effect_runtime *rt)
         if (command_queue *q = rt->get_command_queue())
             if (command_list *imm = q->get_immediate_command_list())
                 if (CmdState *cs = imm->get_private_data<CmdState>())
-                    if (cs->pass_open && cs->frame == g.frame)
-                        end_pass(imm, *cs);
+                    if (cs->frame == g.frame)
+                    {
+                        if (cs->pass_open)
+                            end_pass(imm, *cs);
+                        cs->pass_open = false;
+                        end_all_runs(imm, *cs);
+                    }
     pool_end_frame();
     uint64_t detected_rr;
     {

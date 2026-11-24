@@ -44,6 +44,7 @@ static void unregister_all()
     reshade::unregister_event<addon_event::destroy_resource>(on_destroy_resource);
     reshade::unregister_event<addon_event::destroy_pipeline>(on_destroy_pipeline);
     reshade::unregister_event<addon_event::init_pipeline>(on_init_pipeline);
+    reshade::unregister_event<addon_event::close_command_list>(on_close_cmd_list);
     reshade::unregister_event<addon_event::reset_command_list>(on_reset_cmd_list);
     reshade::unregister_event<addon_event::destroy_command_list>(on_destroy_cmd_list);
     reshade::unregister_event<addon_event::init_command_list>(on_init_cmd_list);
@@ -79,6 +80,7 @@ extern "C" __declspec(dllexport) bool AddonInit(HMODULE addon_module, HMODULE re
     reshade::register_event<addon_event::init_command_list>(on_init_cmd_list);
     reshade::register_event<addon_event::destroy_command_list>(on_destroy_cmd_list);
     reshade::register_event<addon_event::reset_command_list>(on_reset_cmd_list);
+    reshade::register_event<addon_event::close_command_list>(on_close_cmd_list);
     reshade::register_event<addon_event::init_resource>(on_init_resource);
     reshade::register_event<addon_event::init_pipeline_layout>(on_init_pipeline_layout);
     reshade::register_event<addon_event::destroy_pipeline_layout>(on_destroy_pipeline_layout);
@@ -112,7 +114,7 @@ extern "C" __declspec(dllexport) bool AddonInit(HMODULE addon_module, HMODULE re
     reshade::register_event<addon_event::reshade_present>(on_reshade_present);
     reshade::register_overlay("CRCGI Injector", draw_overlay);
     s_registered = true;
-    log_msg(reshade::log::level::info, std::string("Loaded, ") + (sizeof(void *) == 8 ? "64-bit" : "32-bit") + " (built against ReShade " +
+    log_msg(reshade::log::level::info, std::string("Loaded " CRCGI_ADDON_VERSION ", ") + (sizeof(void *) == 8 ? "64-bit" : "32-bit") + " (built against ReShade " +
             CRCGI_RESHADE_REVISION + "). Settings: " +
             (g.ini_path.empty() ? std::string("not saved") : g.ini_path.u8string()));
     return true;

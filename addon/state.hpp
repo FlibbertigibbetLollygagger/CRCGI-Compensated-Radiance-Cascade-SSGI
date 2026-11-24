@@ -42,6 +42,8 @@ using reshade::addon_event;
 
 extern "C" IMAGE_DOS_HEADER __ImageBase;   // this add-on's own module (linker-provided)
 
+#define CRCGI_ADDON_VERSION "v2"            // release name, shown in the overlay's Build line and the log
+
 #ifndef CRCGI_RESHADE_REVISION
 #define CRCGI_RESHADE_REVISION "unknown"   // set by CMake from the ReShade checkout used for the build
 #endif
@@ -89,9 +91,9 @@ static const char ROLE_ITEMS[] = "-\0Force render here (advanced)\0Depth\0Normal
 // whatever is drawn after it). The effect works on that copy and adds its light to the final image, so everything drawn after the copy
 // stays untouched.
 enum Feed : int { FEED_NORMALS = 0, FEED_ALBEDO, FEED_MOTION, FEED_MATERIAL, FEED_HDR, FEED_SCENE, FEED_COUNT };
-// The material feed (metalness / specular) is implemented but not offered in the overlay: the shader's matching
-// switch is hidden too. Set to true to expose it again.
-static constexpr bool UI_MATERIAL = false;
+// The material feed (metalness / specular): the shader's 'Use Game Material (reflectivity) If Provided' switch reads it. Set to false to
+// hide it from the overlay.
+static constexpr bool UI_MATERIAL = true;
 static const char *const FEED_SEMANTIC[FEED_COUNT] = { "NORMAL", "CRCGI_ALBEDO", "CRCGI_MOTION", "CRCGI_MATERIAL", "CRCGI_HDRSCENE", "CRCGI_SCENE" };
 static const char *const FEED_LABEL[FEED_COUNT] = { "Normals", "Albedo", "Motion vectors", "Material (reflectivity)", "HDR scene light", "Finished frame" };
 // The shader's switch for each feed (category Game Integration).
@@ -147,7 +149,7 @@ static float upscale_fraction(int mode, float custom_pct)
 enum CamSource : int { CAM_NONE = 0, CAM_DETECTED, CAM_PICKED };
 
 // Version of the settings file format (crcgi_injector.ini next to the game's executable).
-static const int SETTINGS_VERSION = 2;
+static const int SETTINGS_VERSION = 3;
 
 // A game texture, identified across runs: its description plus its index among the live textures with the same description at
 // the time it was created (games create their render targets in a fixed order).
@@ -180,10 +182,19 @@ struct LayerRef
     bool operator==(const LayerRef &o) const { return key == o.key && slot == o.slot; }
 };
 
+// How a feed is captured when the frame draws into its texture more than once.
+//   CAP_RUN     G-buffer data (normals, albedo, motion, material): followed by target layout, copied at the end of each write run; a later
+//               run replaces the copy if it continues it (same texture, not cleared) or draws more.
+//   CAP_LARGEST the HDR scene light: the interval that draws most into it (its exact layer when assigned from a layer).
+//   CAP_FIRST   the finished frame: the first capture of the frame (the UI is often drawn into the same target right after it).
+enum CapturePolicy : int { CAP_RUN = 0, CAP_LARGEST, CAP_FIRST };
+static int feed_policy(int feed) { return feed == FEED_SCENE ? CAP_FIRST : (feed == FEED_HDR ? CAP_LARGEST : CAP_RUN); }
+
 struct FeedConfig
 {
     int source = SRC_LAYER;    // where the feed is taken from: a layer (binding interval) or a texture picked in the profiler
-    LayerRef ref;              // SRC_LAYER
+    LayerRef ref;              // SRC_LAYER: the layer it was assigned from (shown in the overlay)
+    uint64_t layout = 0;       // SRC_LAYER: that layer's target layout (see layout_of): what CAP_RUN feeds capture, whichever texture is bound
     TexSig tex;                // SRC_TEXTURE
     bool enabled = false;      // the add-on provides this feed (independent of the shader's own switch)
     bool sync = false;         // also set the shader's own switch to match (on: the switch is on exactly while the feed is delivered)
@@ -194,7 +205,12 @@ struct FeedConfig
     bool invert = false;
     int channel = 0;           // material: 0 R, 1 G, 2 B, 3 A
     int meaning = 0;           // material: 0 metalness, 1 specular / reflectance, 2 roughness, 3 smoothness
-    bool assigned() const { return source == SRC_TEXTURE ? tex.valid() : ref.valid(); }
+    bool assigned() const { return source == SRC_TEXTURE ? tex.valid() : (ref.valid() || layout != 0); }
+    // SRC_LAYER: is a binding interval with this key and layout the assigned layer?
+    bool layer_match(int feed, uint64_t key, uint64_t lay) const
+    {
+        return feed_policy(feed) == CAP_RUN && layout != 0 ? layout == lay : (ref.valid() && ref.key == key);
+    }
 };
 
 struct RtSlot
@@ -212,6 +228,7 @@ struct RtSlot
 struct Pass
 {
     uint64_t key = 0;
+    uint64_t layout = 0;                 // target layout (formats, screen-relative sizes, depth): the same in every frame and every run
     uint32_t order = 0, draws = 0, ps = 0, vs = 0, rt_count = 0;
     uint32_t ps_changes = 0;
     uint64_t cl = 0;                     // command list that recorded it
@@ -272,6 +289,22 @@ struct PendingCapture
     bool prev = false;
     int prev_slot = 0;
     bool snapshots = false;
+    uint32_t draws = 1;                  // draws of the write run the feed captures belong to (see FeedRun)
+};
+
+// A feed's write run on one command list: consecutive binding intervals with the feed's target layout that draw into the same texture
+// (a G-buffer is often drawn in several intervals: the game rebinds the same targets, changes state, splits static and dynamic
+// geometry). The texture is copied once, when the run ends: at the first event that can change it or read it in another role (another
+// set of targets, a clear of it, a compute dispatch, a barrier on it, the end of the command list), so the copy holds everything the
+// run drew, whichever draw happened to come first and however the camera culls.
+struct FeedRun
+{
+    bool open = false;
+    uint64_t frame = 0;
+    uint64_t layout = 0;
+    int slot = 0;
+    RtSlot src;
+    uint32_t draws = 0;
 };
 
 struct CRCGI_UUID("FB2E1E5D-B900-4C39-9EEE-3B1AD6F285FD") CmdState
@@ -287,6 +320,8 @@ struct CRCGI_UUID("FB2E1E5D-B900-4C39-9EEE-3B1AD6F285FD") CmdState
     bool blend = false, zwrite = false;  // output-merger state of the bound pipeline(s), where known
     uint32_t blend_draws = 0, zwrite_draws = 0;
     uint32_t rt_count = 0;
+    uint64_t layout = 0;           // target layout of the open interval
+    FeedRun run[FEED_COUNT];       // open write runs of the feeds on this command list
     resource_view rtv[8];          // views bound by the game (resolved lazily at the first draw of the pass)
     resource_view dsv_view = { 0 };
     RtSlot rt[8];
@@ -325,7 +360,9 @@ struct FeedTex
     bool srgb_source = false;     // the game wrote it through an sRGB view
     uint64_t frame = ~0ull;       // frame of the last successful capture
     uint64_t cl = 0;              // command list it was captured on
-    uint64_t cap_key = 0;         // layer key of the binding it was captured at this frame (a later capture of another binding is refused)
+    resource cap_res = { 0 };     // texture of this frame's capture
+    uint32_t cap_draws = 0;       // draws that went into it this frame
+    bool tainted = false;         // that texture was cleared after the capture (a new use of the memory: a later run is not a continuation)
     uint64_t bound_frame = ~0ull; // frame in which the injection last handed it to the shader
     std::string status;           // why the last capture or binding did not happen (empty = fine)
 };
@@ -444,6 +481,11 @@ struct Globals
     uint64_t key_down_since[KA_COUNT] = {};     // ms tick when the key went down (0 = up)
     uint64_t key_next_repeat[KA_COUNT] = {};
     int repeat_delay_ms = 350, repeat_rate_ms = 55;
+
+    // shader switches driven by the add-on: consecutive frames a feed was delivered, and the switch state (see drive_switches)
+    uint32_t feed_streak[FEED_COUNT] = {};
+    uint64_t feed_streak_frame[FEED_COUNT] = {};
+    bool feed_on[FEED_COUNT] = {};
 
     // feeds taken from a texture: the live resource that matches each feed's TexSig (0 = not created / not matched yet)
     resource feed_res[FEED_COUNT] = {};
@@ -872,7 +914,7 @@ static void write_config(std::ostream &f, bool targets_only)
         const FeedConfig &c = g.feed[i];
         f << "[Feed" << i << "]\n";
         write_ref(f, "Ref", c.ref);
-        f << "Source=" << c.source << "\nTex=";
+        f << "Layout=" << hex16(c.layout) << "\nSource=" << c.source << "\nTex=";
         write_tex_sig(f, c.tex);
         f << "\nEnabled=" << c.enabled << "\nSync=" << c.sync << "\nMode=" << c.mode << "\nSpace=" << c.space << "\nUnits=" << c.units
           << "\nFlipY=" << c.flip_y << "\nInvert=" << c.invert << "\nChannel=" << c.channel << "\nMeaning=" << c.meaning << "\n\n";
@@ -953,7 +995,7 @@ static bool read_config_locked(const std::filesystem::path &path, bool targets_o
     std::string line, section;
     bool cross_list = g.cross_list_feeds;
     bool sync_seen[FEED_COUNT] = {}, sync_val[FEED_COUNT] = {};
-    bool ref_seen[FEED_COUNT] = {};
+    bool ref_seen[FEED_COUNT] = {}, layout_seen[FEED_COUNT] = {};
     while (std::getline(f, line))
     {
         line = trim(line);
@@ -1015,6 +1057,7 @@ static bool read_config_locked(const std::filesystem::path &path, bool targets_o
                 continue;
             FeedConfig &c = g.feed[i];
             if (k == "Ref") { c.ref = parse_ref(v); ref_seen[i] = true; }
+            else if (k == "Layout") { c.layout = std::strtoull(v.c_str(), nullptr, 16); layout_seen[i] = true; }
             else if (k == "Enabled") c.enabled = b();
             else if (k == "Sync") { sync_seen[i] = true; sync_val[i] = b(); }
             else if (k == "Source") c.source = std::clamp(std::atoi(v.c_str()), 0, 1);
@@ -1051,7 +1094,15 @@ static bool read_config_locked(const std::filesystem::path &path, bool targets_o
             g.feed_res[i] = resource{ 0 };                          // found again by the pool (rematch_feeds)
             g.feed_lost_frame[i] = std::max<uint64_t>(g.frame, 1);
         }
-        (void)ref_seen[i];
+        if (g.feed[i].source == SRC_LAYER && ref_seen[i] && !layout_seen[i] && g.feed[i].ref.valid())
+        {
+            // A layer assignment without a layout: its key was built another way and cannot be found. The feed stays configured
+            // (switches, encoding) but has to be assigned again from the layer list once.
+            g.feed[i].ref = LayerRef();
+            g.feed[i].enabled = false;
+            log_msg(reshade::log::level::warning, std::string(FEED_LABEL[i]) + ": the saved layer assignment has no layer layout and cannot be found, "
+                    "assign it again (Layers tab, Role). Feeds picked in the profiler (textures) are kept.");
+        }
     }
     g.rematch_frame = 0;
     if (!targets_only)
